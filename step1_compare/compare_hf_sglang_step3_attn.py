@@ -154,6 +154,12 @@ def normalize_for_compare(name: str, x: torch.Tensor, side: str) -> torch.Tensor
     return x
 
 
+def squeeze_single_step_tail(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim == 2 and x.shape[0] == 1:
+        return x[0]
+    return x
+
+
 def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_index: dict[str, int]) -> None:
     hf_idx = hf_index.get(name, -1)
     sg_idx = sg_index.get(name, -1)
@@ -174,6 +180,8 @@ def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_
     x_sg = normalize_for_compare(name, x_sg, side="sg")
     x_hf = align_single_step(name, x_hf)
     x_sg = align_single_step(name, x_sg)
+    x_hf = squeeze_single_step_tail(x_hf)
+    x_sg = squeeze_single_step_tail(x_sg)
 
     print("  hf shape/dtype:", tuple(x_hf.shape), x_hf.dtype)
     print("  sg shape/dtype:", tuple(x_sg.shape), x_sg.dtype)

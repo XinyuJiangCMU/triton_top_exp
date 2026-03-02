@@ -33,6 +33,13 @@ DEFAULT_ENV_KEYS = [
 ]
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class CompareSummary:
     total: int
@@ -100,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", type=str, default=None)
     parser.add_argument("--save-detail", type=str, default=None)
     parser.add_argument("--manifest-json", type=str, default=None)
+    parser.add_argument("--hf-hook-debug", action="store_true")
     return parser.parse_args()
 
 
@@ -272,6 +280,45 @@ def _save_detail(path: str | Path, details: list[dict[str, Any]], summary: Compa
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _snapshot_dump_dirs(root: str | Path = "/tmp/dumper") -> dict[str, tuple[int, int]]:
+    root = Path(root)
+    snapshot: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return snapshot
+    for dump_dir in root.glob("sglang_dump_*"):
+        if not dump_dir.is_dir():
+            continue
+        latest_mtime_ns = 0
+        file_count = 0
+        for path in dump_dir.glob("*.pt"):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+            file_count += 1
+        snapshot[str(dump_dir)] = (latest_mtime_ns, file_count)
+    return snapshot
+
+
+def _describe_dump_dir_changes(
+    before: dict[str, tuple[int, int]],
+    after: dict[str, tuple[int, int]],
+) -> dict[str, list[str]]:
+    created = sorted(set(after) - set(before))
+    touched = []
+    for dump_dir, after_state in after.items():
+        before_state = before.get(dump_dir)
+        if before_state is None:
+            continue
+        if after_state != before_state:
+            touched.append(dump_dir)
+    return {
+        "created": created,
+        "touched": sorted(touched),
+    }
+
+
 def sglang_generate_with_logprobs(
     host: str,
     port: int,
@@ -279,6 +326,7 @@ def sglang_generate_with_logprobs(
     sampling_params: dict[str, Any],
 ) -> tuple[list[int], list[float], list[int], list[str]]:
     base_url = f"http://{host}:{port}"
+    dump_dirs_before = _snapshot_dump_dirs()
     payload = {
         "input_ids": prompt_ids,
         "sampling_params": sampling_params,
@@ -287,6 +335,10 @@ def sglang_generate_with_logprobs(
         "stream": False,
     }
     response = requests.post(f"{base_url}/generate", json=payload, timeout=120)
+    dump_dirs_after = _snapshot_dump_dirs()
+    dump_changes = _describe_dump_dir_changes(dump_dirs_before, dump_dirs_after)
+    print(f"[SGLang dump] created_dirs={dump_changes['created']}")
+    print(f"[SGLang dump] touched_dirs={dump_changes['touched']}")
     if response.status_code != 200:
         raise RuntimeError(f"SGLang request failed: {response.status_code} {response.text}")
     ret = response.json()
@@ -313,6 +365,7 @@ def hf_get_logprobs(
     attn_implementation: str,
     dtype: str,
     use_batch_invariant: bool,
+    hf_hook_debug: bool,
 ) -> torch.Tensor:
     if use_batch_invariant:
         try:
@@ -334,6 +387,8 @@ def hf_get_logprobs(
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
     except Exception:
         apply_rotary_pos_emb = None
+
+    debug_hf_hook = hf_hook_debug or _bool_env("HF_HOOK_DEBUG", False)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -362,6 +417,47 @@ def hf_get_logprobs(
     hook_handles = []
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
+    hook_debug_printed = False
+
+    def _log_hf_dump_failure(stage: str, exc: Exception, **context: Any) -> None:
+        context_parts = []
+        for key, value in context.items():
+            context_parts.append(f"{key}={value}")
+        suffix = f" ({', '.join(context_parts)})" if context_parts else ""
+        print(f"[HF dump] {stage} failed: {type(exc).__name__}: {exc}{suffix}")
+
+    def _debug_print_hf_hook_state(
+        source: str,
+        position_embeddings: Any,
+        qn: torch.Tensor | None = None,
+        kn: torch.Tensor | None = None,
+    ) -> None:
+        nonlocal hook_debug_printed
+        if hook_debug_printed or not debug_hf_hook:
+            return
+        hook_debug_printed = True
+        msg = [f"[HF dump] position_embeddings source={source}"]
+        if position_embeddings is None:
+            msg.append("type=None")
+        else:
+            msg.append(f"type={type(position_embeddings).__name__}")
+            try:
+                msg.append(f"len={len(position_embeddings)}")
+            except Exception:
+                msg.append("len=<unavailable>")
+        if qn is not None:
+            msg.append(f"qn.shape={tuple(qn.shape)}")
+            msg.append(f"qn.dtype={qn.dtype}")
+        if kn is not None:
+            msg.append(f"kn.shape={tuple(kn.shape)}")
+            msg.append(f"kn.dtype={kn.dtype}")
+        if isinstance(position_embeddings, tuple) and len(position_embeddings) == 2:
+            cos, sin = position_embeddings
+            if hasattr(cos, "shape"):
+                msg.append(f"cos.shape={tuple(cos.shape)}")
+            if hasattr(sin, "shape"):
+                msg.append(f"sin.shape={tuple(sin.shape)}")
+        print(", ".join(msg))
 
     # Layer-0 pre-attention probes.
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
@@ -401,12 +497,15 @@ def hf_get_logprobs(
             def _capture_last_attn_output(_module, args, kwargs, output):
                 nonlocal attn_out_last_layer
                 attn_out_last_layer = output[0] if isinstance(output, tuple) else output
-                try:
-                    hidden_states = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
-                    if hidden_states is None:
-                        return
-                    _maybe_dump("attn_input_last_layer", _hf_slice(hidden_states))
+                hidden_states = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+                if hidden_states is None:
+                    print("[HF dump] attn_input_last_layer unavailable: hidden_states missing")
+                    return
 
+                _maybe_dump("attn_input_last_layer", _hf_slice(hidden_states))
+
+                q = k = v = None
+                try:
                     if hasattr(_module, "q_proj") and hasattr(_module, "k_proj") and hasattr(_module, "v_proj"):
                         q = _module.q_proj(hidden_states)
                         k = _module.k_proj(hidden_states)
@@ -414,49 +513,97 @@ def hf_get_logprobs(
                         _maybe_dump("q_pre_norm", _hf_slice(q))
                         _maybe_dump("k_pre_norm", _hf_slice(k))
                         _maybe_dump("v_pre_norm", _hf_slice(v))
+                except Exception as exc:
+                    _log_hf_dump_failure(
+                        "q_pre_norm/k_pre_norm/v_pre_norm",
+                        exc,
+                        hidden_states_shape=tuple(hidden_states.shape),
+                        hidden_states_dtype=hidden_states.dtype,
+                    )
 
-                        qn, kn = q, k
-                        if hasattr(_module, "q_norm") and hasattr(_module, "k_norm"):
-                            input_shape = hidden_states.shape[:-1]
-                            num_heads = getattr(_module, "num_heads", None)
-                            num_kv_heads = getattr(_module, "num_key_value_heads", num_heads)
-                            head_dim = getattr(_module, "head_dim", None)
-                            if num_heads is not None and num_kv_heads is not None and head_dim is not None:
-                                q_hidden_shape = (*input_shape, num_heads, head_dim)
-                                k_hidden_shape = (*input_shape, num_kv_heads, head_dim)
-                                qn = _module.q_norm(q.view(q_hidden_shape)).transpose(1, 2)
-                                kn = _module.k_norm(k.view(k_hidden_shape)).transpose(1, 2)
-                                qn_dump = qn.transpose(1, 2).reshape_as(q)
-                                kn_dump = kn.transpose(1, 2).reshape_as(k)
-                                _maybe_dump("q_post_norm", _hf_slice(qn_dump))
-                                _maybe_dump("k_post_norm", _hf_slice(kn_dump))
+                qn = kn = None
+                qn_dump = kn_dump = None
+                if q is not None and k is not None:
+                    try:
+                        if not (hasattr(_module, "q_norm") and hasattr(_module, "k_norm")):
+                            raise RuntimeError("module missing q_norm/k_norm")
+                        input_shape = hidden_states.shape[:-1]
+                        head_dim = getattr(_module, "head_dim", None)
+                        if head_dim is None:
+                            raise RuntimeError(
+                                f"missing metadata: head_dim={head_dim}"
+                            )
+                        if q.shape[-1] % head_dim != 0 or k.shape[-1] % head_dim != 0:
+                            raise RuntimeError(
+                                f"invalid q/k shape for head_dim={head_dim}: q.shape={tuple(q.shape)}, k.shape={tuple(k.shape)}"
+                            )
+                        num_heads = q.shape[-1] // head_dim
+                        num_kv_heads = k.shape[-1] // head_dim
+                        q_hidden_shape = (*input_shape, num_heads, head_dim)
+                        k_hidden_shape = (*input_shape, num_kv_heads, head_dim)
+                        qn = _module.q_norm(q.view(q_hidden_shape)).transpose(1, 2)
+                        kn = _module.k_norm(k.view(k_hidden_shape)).transpose(1, 2)
+                        qn_dump = qn.transpose(1, 2).reshape_as(q)
+                        kn_dump = kn.transpose(1, 2).reshape_as(k)
+                        _maybe_dump("q_post_norm", _hf_slice(qn_dump))
+                        _maybe_dump("k_post_norm", _hf_slice(kn_dump))
+                    except Exception as exc:
+                        _log_hf_dump_failure(
+                            "q_post_norm/k_post_norm",
+                            exc,
+                            q_shape=tuple(q.shape),
+                            k_shape=tuple(k.shape),
+                            q_dtype=q.dtype,
+                            k_dtype=k.dtype,
+                        )
 
-                                position_embeddings = kwargs.get(
-                                    "position_embeddings",
-                                    args[1] if len(args) > 1 else None,
-                                )
-                                if (
-                                    position_embeddings is None
-                                    or not isinstance(position_embeddings, tuple)
-                                    or len(position_embeddings) != 2
-                                    or apply_rotary_pos_emb is None
-                                ):
-                                    print(
-                                        "[HF dump] skip q_post_rope/k_post_rope: "
-                                        "position_embeddings or apply_rotary_pos_emb unavailable"
-                                    )
-                                else:
-                                    cos, sin = position_embeddings
-                                    q_rope, k_rope = apply_rotary_pos_emb(qn, kn, cos, sin)
-                                    q_rope_dump = q_rope.transpose(1, 2).reshape_as(q)
-                                    k_rope_dump = k_rope.transpose(1, 2).reshape_as(k)
-                                    _maybe_dump("q_post_rope", _hf_slice(q_rope_dump))
-                                    _maybe_dump("k_post_rope", _hf_slice(k_rope_dump))
+                if qn is not None and kn is not None:
+                    position_embeddings = None
+                    position_source = "missing"
+                    if "position_embeddings" in kwargs:
+                        position_embeddings = kwargs["position_embeddings"]
+                        position_source = "kwargs"
+                    elif len(args) > 1:
+                        position_embeddings = args[1]
+                        position_source = "args[1]"
+                    _debug_print_hf_hook_state(position_source, position_embeddings, qn, kn)
+                    try:
+                        if apply_rotary_pos_emb is None:
+                            raise RuntimeError("apply_rotary_pos_emb unavailable")
+                        if position_embeddings is None:
+                            raise RuntimeError("position_embeddings unavailable")
+                        if not isinstance(position_embeddings, tuple) or len(position_embeddings) != 2:
+                            raise RuntimeError(
+                                f"position_embeddings must be tuple(len=2), got {type(position_embeddings).__name__}"
+                            )
+                        cos, sin = position_embeddings
+                        q_rope, k_rope = apply_rotary_pos_emb(qn, kn, cos, sin)
+                        q_rope_dump = q_rope.transpose(1, 2).reshape_as(q)
+                        k_rope_dump = k_rope.transpose(1, 2).reshape_as(k)
+                        _maybe_dump("q_post_rope", _hf_slice(q_rope_dump))
+                        _maybe_dump("k_post_rope", _hf_slice(k_rope_dump))
+                    except Exception as exc:
+                        rope_context = {
+                            "position_source": position_source,
+                            "position_type": type(position_embeddings).__name__ if position_embeddings is not None else None,
+                            "qn_shape": tuple(qn.shape),
+                            "kn_shape": tuple(kn.shape),
+                        }
+                        if isinstance(position_embeddings, tuple) and len(position_embeddings) == 2:
+                            cos, sin = position_embeddings
+                            rope_context["cos_shape"] = tuple(cos.shape)
+                            rope_context["sin_shape"] = tuple(sin.shape)
+                        _log_hf_dump_failure("q_post_rope/k_post_rope", exc, **rope_context)
 
+                try:
                     if attn_out_last_layer is not None:
                         _maybe_dump("attn_context_before_o_proj", _hf_slice(attn_out_last_layer))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_hf_dump_failure(
+                        "attn_context_before_o_proj",
+                        exc,
+                        attn_out_shape=tuple(attn_out_last_layer.shape) if hasattr(attn_out_last_layer, "shape") else None,
+                    )
 
             hook_handles.append(
                 last_layer.self_attn.register_forward_hook(
@@ -548,6 +695,7 @@ def main() -> None:
         attn_implementation=args.attn_implementation,
         dtype=args.dtype,
         use_batch_invariant=args.use_batch_invariant,
+        hf_hook_debug=args.hf_hook_debug,
     )
     n_gen = len(gen_token_ids)
     hf_slice = hf_logprobs_full[0, prompt_len - 1 : prompt_len - 1 + n_gen]
