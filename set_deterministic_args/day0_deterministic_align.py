@@ -418,6 +418,10 @@ def hf_get_logprobs(
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
     hook_debug_printed = False
+    layer0_raw_hf = None
+    layer0_after_input_layernorm = None
+    layer0_self_attn_input = None
+    hf_prepare_alias_logged = False
 
     def _log_hf_dump_failure(stage: str, exc: Exception, **context: Any) -> None:
         context_parts = []
@@ -425,6 +429,42 @@ def hf_get_logprobs(
             context_parts.append(f"{key}={value}")
         suffix = f" ({', '.join(context_parts)})" if context_parts else ""
         print(f"[HF dump] {stage} failed: {type(exc).__name__}: {exc}{suffix}")
+
+    def _log_prepare_tensor_meta(name: str, value: torch.Tensor | None) -> None:
+        if value is None:
+            print(f"[HF prepare] {name} unavailable")
+            return
+        print(
+            f"[HF prepare] {name} "
+            f"shape={tuple(value.shape)} dtype={value.dtype} device={value.device} "
+            f"stride={tuple(value.stride())} contiguous={value.is_contiguous()} "
+            f"storage_offset={value.storage_offset()}"
+        )
+
+    def _log_tensor_exact_compare(name: str, lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> None:
+        if lhs is None or rhs is None:
+            print(f"[HF prepare] {name} compare unavailable")
+            return
+        lhs_cmp = _hf_slice(lhs).detach().cpu().contiguous()
+        rhs_cmp = _hf_slice(rhs).detach().cpu().contiguous()
+        if lhs_cmp.shape != rhs_cmp.shape:
+            print(
+                f"[HF prepare] {name} shape_mismatch lhs_shape={tuple(lhs_cmp.shape)} rhs_shape={tuple(rhs_cmp.shape)}"
+            )
+            return
+        bitwise_equal = lhs_cmp.dtype == rhs_cmp.dtype and torch.equal(lhs_cmp, rhs_cmp)
+        flat_lhs = lhs_cmp.reshape(-1)
+        flat_rhs = rhs_cmp.reshape(-1)
+        neq = torch.nonzero(flat_lhs != flat_rhs, as_tuple=False).reshape(-1)
+        diff_count = int(neq.numel())
+        if diff_count == 0:
+            print(f"[HF prepare] {name} bitwise_equal={bitwise_equal} differing_elements=0")
+            return
+        first_idx = int(neq[0].item())
+        print(
+            f"[HF prepare] {name} bitwise_equal={bitwise_equal} differing_elements={diff_count} "
+            f"first_mismatch_flat_index={first_idx} lhs={flat_lhs[first_idx].item()} rhs={flat_rhs[first_idx].item()}"
+        )
 
     def _debug_print_hf_hook_state(
         source: str,
@@ -464,10 +504,13 @@ def hf_get_logprobs(
         first_layer = model.model.layers[0]
 
         def _capture_layer0_raw(_module, args, kwargs):
+            nonlocal layer0_raw_hf
             try:
                 hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
                 if hs is not None:
+                    layer0_raw_hf = hs
                     _maybe_dump("layer0_attn_input_raw", _hf_slice(hs))
+                    _log_prepare_tensor_meta("layer0_attn_input_raw", _hf_slice(hs))
             except Exception:
                 pass
 
@@ -475,13 +518,53 @@ def hf_get_logprobs(
             first_layer.register_forward_pre_hook(_capture_layer0_raw, with_kwargs=True)
         )
 
+        if hasattr(first_layer, "input_layernorm"):
+            def _capture_layer0_after_input_layernorm(_module, args, kwargs, output):
+                del args, kwargs
+                nonlocal layer0_after_input_layernorm
+                try:
+                    hs = output[0] if isinstance(output, tuple) else output
+                    if hs is not None:
+                        layer0_after_input_layernorm = hs
+                        _maybe_dump("layer0_after_input_layernorm", _hf_slice(hs))
+                        _log_prepare_tensor_meta("layer0_after_input_layernorm", _hf_slice(hs))
+                except Exception as exc:
+                    _log_hf_dump_failure("layer0_after_input_layernorm", exc)
+
+            hook_handles.append(
+                first_layer.input_layernorm.register_forward_hook(
+                    _capture_layer0_after_input_layernorm, with_kwargs=True
+                )
+            )
+
         if hasattr(first_layer, "self_attn"):
             def _capture_layer0_after_prepare(_module, args, kwargs, output):
                 del output
+                nonlocal layer0_self_attn_input, hf_prepare_alias_logged
                 try:
                     hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
                     if hs is not None:
+                        layer0_self_attn_input = hs
+                        _maybe_dump("layer0_self_attn_input", _hf_slice(hs))
                         _maybe_dump("layer0_attn_input_after_prepare", _hf_slice(hs))
+                        if not hf_prepare_alias_logged:
+                            print(
+                                "[HF prepare] layer0_attn_input_after_prepare is a compatibility alias "
+                                "for layer0_self_attn_input; in HF this is self_attn hidden_states "
+                                "after decoder input_layernorm, not a true SGLang prepare_attn output"
+                            )
+                            hf_prepare_alias_logged = True
+                        _log_prepare_tensor_meta("layer0_self_attn_input", _hf_slice(hs))
+                        _log_tensor_exact_compare(
+                            "layer0_raw_vs_layer0_self_attn_input",
+                            layer0_raw_hf,
+                            layer0_self_attn_input,
+                        )
+                        _log_tensor_exact_compare(
+                            "layer0_after_input_layernorm_vs_layer0_self_attn_input",
+                            layer0_after_input_layernorm,
+                            layer0_self_attn_input,
+                        )
                 except Exception:
                     pass
 

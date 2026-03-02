@@ -91,9 +91,8 @@ def parse_args() -> argparse.Namespace:
             "k_post_norm",
             "q_post_rope",
             "k_post_rope",
-            "attn_context_before_o_proj",
         ],
-        help="Names to compare. Defaults to the 5 key attention checkpoints.",
+        help="Names to compare. Defaults to the key norm/rope checkpoints.",
     )
     parser.add_argument(
         "--list-latest",
@@ -160,6 +159,84 @@ def squeeze_single_step_tail(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def head_layout_sanity_compare(name: str, x_hf: torch.Tensor, x_sg: torch.Tensor) -> None:
+    layout = {
+        "q_pre_norm": (32, 128),
+        "k_pre_norm": (8, 128),
+    }.get(name)
+    if layout is None or x_hf.ndim != 1 or x_sg.ndim != 1:
+        return
+
+    num_heads, head_dim = layout
+    expected = num_heads * head_dim
+    if x_hf.numel() != expected or x_sg.numel() != expected:
+        return
+
+    hf_heads = x_hf.float().reshape(num_heads, head_dim)
+    sg_heads = x_sg.float().reshape(num_heads, head_dim)
+    direct_diff = (hf_heads - sg_heads).abs()
+    print("  head-level direct diff max_abs:", direct_diff.max().item())
+    print("  head-level direct diff mean_abs:", direct_diff.mean().item())
+
+    hf_transposed = hf_heads.transpose(0, 1).reshape(-1)
+    transpose_diff = (hf_transposed - x_sg.float().reshape(-1)).abs()
+    print("  transpose sanity before mean_abs:", direct_diff.mean().item())
+    print("  transpose sanity after mean_abs:", transpose_diff.mean().item())
+
+
+def compute_canonical_tensor(
+    name: str,
+    dump_dir: Path,
+    index_map: dict[str, int],
+    side: str,
+) -> torch.Tensor | None:
+    idx = index_map.get(name, -1)
+    if idx <= 0:
+        return None
+    try:
+        x = load_value(dump_dir, name, idx)
+    except FileNotFoundError:
+        return None
+    x = normalize_for_compare(name, x, side=side)
+    x = align_single_step(name, x)
+    x = squeeze_single_step_tail(x)
+    return x
+
+
+def compare_rope_delta(
+    base_name: str,
+    rope_name: str,
+    label: str,
+    hf_dir: Path,
+    sg_dir: Path,
+    hf_index: dict[str, int],
+    sg_index: dict[str, int],
+) -> None:
+    hf_base = compute_canonical_tensor(base_name, hf_dir, hf_index, side="hf")
+    hf_rope = compute_canonical_tensor(rope_name, hf_dir, hf_index, side="hf")
+    sg_base = compute_canonical_tensor(base_name, sg_dir, sg_index, side="sg")
+    sg_rope = compute_canonical_tensor(rope_name, sg_dir, sg_index, side="sg")
+
+    print(f"\n[{label}]")
+    if any(x is None for x in [hf_base, hf_rope, sg_base, sg_rope]):
+        print("  -> skip (missing tensor)")
+        return
+
+    hf_delta = hf_rope - hf_base
+    sg_delta = sg_rope - sg_base
+
+    print("  hf shape/dtype:", tuple(hf_delta.shape), hf_delta.dtype)
+    print("  sg shape/dtype:", tuple(sg_delta.shape), sg_delta.dtype)
+
+    if hf_delta.shape != sg_delta.shape:
+        print("  -> shape mismatch, skip")
+        return
+
+    diff = (hf_delta.float() - sg_delta.float()).abs()
+    print("  max_abs:", diff.max().item())
+    print("  mean_abs:", diff.mean().item())
+
+
 def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_index: dict[str, int]) -> None:
     hf_idx = hf_index.get(name, -1)
     sg_idx = sg_index.get(name, -1)
@@ -199,6 +276,7 @@ def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_
         diff = (x_hf.float() - x_sg.float()).abs()
         print("  max_abs:", diff.max().item())
         print("  mean_abs:", diff.mean().item())
+        head_layout_sanity_compare(name, x_hf, x_sg)
     else:
         neq = (x_hf != x_sg).sum().item()
         print("  neq_cnt:", neq)
@@ -229,6 +307,9 @@ def main() -> None:
 
     for name in args.focus:
         compare(name, hf_dir, sg_dir, hf_index, sg_index)
+
+    compare_rope_delta("q_post_norm", "q_post_rope", "delta_q", hf_dir, sg_dir, hf_index, sg_index)
+    compare_rope_delta("k_post_norm", "k_post_rope", "delta_k", hf_dir, sg_dir, hf_index, sg_index)
 
 
 if __name__ == "__main__":
