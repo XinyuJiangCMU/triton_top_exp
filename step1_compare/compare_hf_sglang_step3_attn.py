@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
+import argparse
+import json
 from pathlib import Path
 
 import torch
-# prepare_attn -- deterministic done.
-# ====== 按你当前这轮实验日志更新 ======
-# HF dump (day0 脚本侧): partial_name=1772518691.2323422
-# SG dump (server 侧):   partial_name=1772518041.371588
-HF_DIR = Path("/tmp/dumper/sglang_dump_1772518691.2323422")
-SG_DIR = Path("/tmp/dumper/sglang_dump_1772518041.371588")
 
 
-# ====== 按你的当前实验修改这些 index 映射 ======
-HF_INDEX = {
+DEFAULT_HF_DIR = Path("/tmp/dumper/sglang_dump_1772518691.2323422")
+DEFAULT_SG_DIR = Path("/tmp/dumper/sglang_dump_1772518041.371588")
+
+DEFAULT_HF_INDEX = {
     "layer0_hidden_in": 6,
     "layer0_attn_out": 7,
     "layer0_block_out": 8,
@@ -35,7 +33,7 @@ HF_INDEX = {
     "lm_head_weight": 16,
 }
 
-SG_INDEX = {
+DEFAULT_SG_INDEX = {
     "layer0_hidden_in": 64,
     "layer0_q_pre_norm": 65,
     "layer0_k_pre_norm": 66,
@@ -63,15 +61,70 @@ SG_INDEX = {
     "lm_head_weight": -1,
 }
 
-# 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名
-# 这里把 HF 的 layer0_attn_after_input_layernorm_only 映射到其现有命名。
 HF_NAME_OVERRIDE = {
     "layer0_attn_after_input_layernorm_only": "layer0_attn_input_after_prepare",
 }
 
-# True: 将 hidden/attention 类张量统一对齐到“单步语义”
-# - [B, T, D] -> [B, D]（取最后一步）
-# - [T, D] -> [1, D]（取最后一个 token）
+SG_NAME_OVERRIDE = {
+    "layer0_q_pre_norm": "layer0_q_pre_norm",
+    "layer0_k_pre_norm": "layer0_k_pre_norm",
+    "layer0_v_pre_norm": "layer0_v_pre_norm",
+    "layer0_attn_context_before_o_proj": "layer0_attn_context_before_o_proj",
+}
+
+ALL_COMPARE_NAMES = [
+    "input_ids_for_compare",
+    "embedding_output",
+    "layer0_positions",
+    "layer0_attn_input_raw",
+    "layer0_attn_after_input_layernorm_only",
+    "layer0_attn_input_after_prepare",
+    "layer0_hidden_in",
+    "layer0_attn_out",
+    "layer0_block_out",
+    "attn_input_last_layer",
+    "q_pre_norm",
+    "k_pre_norm",
+    "v_pre_norm",
+    "q_post_norm",
+    "k_post_norm",
+    "q_post_rope",
+    "k_post_rope",
+    "attn_context_before_o_proj",
+    "attn_out_last_layer",
+    "final_hidden_before_lm_head",
+    "lm_head_weight",
+]
+
+FOCUS_TO_NAMES = {
+    "full": ALL_COMPARE_NAMES,
+    "layer0": [
+        "input_ids_for_compare",
+        "embedding_output",
+        "layer0_positions",
+        "layer0_attn_input_raw",
+        "layer0_attn_after_input_layernorm_only",
+        "layer0_attn_input_after_prepare",
+        "layer0_hidden_in",
+        "layer0_attn_out",
+        "layer0_block_out",
+    ],
+    "last_layer": [
+        "attn_input_last_layer",
+        "q_pre_norm",
+        "k_pre_norm",
+        "v_pre_norm",
+        "q_post_norm",
+        "k_post_norm",
+        "q_post_rope",
+        "k_post_rope",
+        "attn_context_before_o_proj",
+        "attn_out_last_layer",
+        "final_hidden_before_lm_head",
+        "lm_head_weight",
+    ],
+}
+
 ALIGN_TO_SINGLE_STEP = True
 
 ALIGN_NAMES = {
@@ -92,7 +145,6 @@ ALIGN_NAMES = {
 }
 
 HF_DROP_LAST_TOKEN_NAMES = {
-    # HF teacher-forcing 输入常包含“最后一个 response token”，对齐 SGLang prefill 时需去掉
     "input_ids_for_compare",
     "embedding_output",
     "layer0_positions",
@@ -122,21 +174,132 @@ SQUEEZE_BATCH1_NAMES = {
 }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare HF and SGLang debug dumps for deterministic alignment."
+    )
+    parser.add_argument("--hf-dir", type=Path, default=DEFAULT_HF_DIR)
+    parser.add_argument("--sg-dir", type=Path, default=DEFAULT_SG_DIR)
+    parser.add_argument("--hf-index-json", type=Path, default=None)
+    parser.add_argument("--sg-index-json", type=Path, default=None)
+    parser.add_argument("--auto-index", action="store_true", default=True)
+    parser.add_argument(
+        "--focus",
+        choices=sorted(FOCUS_TO_NAMES.keys()),
+        default="full",
+    )
+    parser.add_argument("--output-txt", type=Path, default=None)
+    return parser.parse_args()
+
+
+class Logger:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def log(self, line: str = "") -> None:
+        self.lines.append(line)
+        print(line)
+
+    def flush_to(self, path: Path | None) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+
+
 def _extract_dump_index(p: Path) -> int:
     return int(p.stem.split("___dump_index=")[1])
 
 
-def load_value(d: Path, name: str, idx: int) -> torch.Tensor:
-    if idx > 0:
-        p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={idx}.pt"
-    else:
+def _score_dump_candidate(name: str, value: torch.Tensor) -> int:
+    shape = tuple(value.shape)
+    ndim = len(shape)
+
+    if name == "lm_head_weight":
+        return 100 if ndim == 2 and shape[0] > 1 and shape[1] > 1 else -1
+
+    if name in {"input_ids_for_compare", "layer0_positions"}:
+        if ndim == 1:
+            return 100 if shape[0] > 1 else 10
+        if ndim == 2:
+            if shape[1] > 1:
+                return 90
+            if shape[0] > 1:
+                return 80
+            return 10
+        return -1
+
+    if ndim == 3:
+        if shape[1] > 1 and shape[2] > 1:
+            return 100
+        if shape[2] > 1:
+            return 40
+        return -1
+    if ndim == 2:
+        if shape[0] > 1 and shape[1] > 1:
+            return 95
+        if shape[1] > 1:
+            return 50
+        return -1
+    if ndim == 1:
+        return 0 if shape[0] > 1 else -1
+    return -1
+
+
+def _load_index_map(path: Path | None, default_map: dict[str, int]) -> dict[str, int]:
+    if path is None:
+        return dict(default_map)
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return {k: int(v) for k, v in payload.items()}
+
+
+def _discover_index_map(
+    dump_dir: Path,
+    compare_names: list[str],
+    side: str,
+    fallback_map: dict[str, int],
+) -> dict[str, int]:
+    resolved = dict(fallback_map)
+    for name in compare_names:
+        if side == "hf":
+            dump_name = HF_NAME_OVERRIDE.get(name, name)
+        else:
+            dump_name = SG_NAME_OVERRIDE.get(name, name)
         matches = sorted(
-            d.glob(f"forward_pass_id=0___rank=0___name={name}___dump_index=*.pt"),
+            dump_dir.glob(f"forward_pass_id=0___rank=0___name={dump_name}___dump_index=*.pt"),
             key=_extract_dump_index,
         )
         if not matches:
-            raise FileNotFoundError(f"missing dump for {name} under {d}")
-        p = matches[0]
+            if name not in resolved:
+                resolved[name] = -1
+            continue
+
+        best_path = None
+        best_score = -1
+        for match in matches:
+            obj = torch.load(match, weights_only=False, map_location="cpu")
+            value = obj["value"] if isinstance(obj, dict) and "value" in obj else obj
+            score = _score_dump_candidate(name, value)
+            if score > best_score or (
+                score == best_score
+                and best_path is not None
+                and _extract_dump_index(match) > _extract_dump_index(best_path)
+            ):
+                best_score = score
+                best_path = match
+
+        if best_path is not None:
+            resolved[name] = _extract_dump_index(best_path)
+        elif name not in resolved:
+            resolved[name] = -1
+    return resolved
+
+
+def load_value(d: Path, name: str, idx: int) -> torch.Tensor:
+    if idx <= 0:
+        raise FileNotFoundError(f"missing dump for {name} under {d}")
+    p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={idx}.pt"
     obj = torch.load(p, weights_only=False, map_location="cpu")
     return obj["value"] if isinstance(obj, dict) and "value" in obj else obj
 
@@ -144,7 +307,6 @@ def load_value(d: Path, name: str, idx: int) -> torch.Tensor:
 def align_single_step(name: str, x: torch.Tensor) -> torch.Tensor:
     if not ALIGN_TO_SINGLE_STEP or name not in ALIGN_NAMES:
         return x
-
     if x.ndim == 3:
         return x[:, -1, :]
     if x.ndim == 2 and x.shape[0] > 1:
@@ -153,36 +315,43 @@ def align_single_step(name: str, x: torch.Tensor) -> torch.Tensor:
 
 
 def normalize_for_compare(name: str, x: torch.Tensor, side: str) -> torch.Tensor:
-    # 把 [1, ...] 统一成 [...]
     if name in SQUEEZE_BATCH1_NAMES and x.ndim >= 1 and x.shape[0] == 1:
         x = x[0]
-
-    # HF teacher-forcing 序列通常比 SGLang prefill 多一个末尾 token
     if side == "hf" and name in HF_DROP_LAST_TOKEN_NAMES:
         if x.ndim == 1 and x.shape[0] > 1:
             x = x[:-1]
         elif x.ndim == 2 and x.shape[0] > 1:
             x = x[:-1, :]
-
     return x
 
 
-def compare(name: str) -> None:
-    hf_idx = HF_INDEX[name]
-    sg_idx = SG_INDEX[name]
+def compare(
+    logger: Logger,
+    name: str,
+    hf_dir: Path,
+    sg_dir: Path,
+    hf_index: dict[str, int],
+    sg_index: dict[str, int],
+) -> None:
+    hf_idx = hf_index.get(name, -1)
+    sg_idx = sg_index.get(name, -1)
     hf_name = HF_NAME_OVERRIDE.get(name, name)
-    sg_name = name
+    sg_name = SG_NAME_OVERRIDE.get(name, name)
 
-    print(f"\n[{name}]")
+    logger.log(f"\n[{name}]")
     if hf_idx <= 0 or sg_idx <= 0:
-        print(f"  -> skip (index not set): hf={hf_idx}, sg={sg_idx}")
+        logger.log(f"  -> skip (index not set): hf={hf_idx}, sg={sg_idx}")
         return
 
     try:
-        x_hf = load_value(HF_DIR, hf_name, hf_idx)
-        x_sg = load_value(SG_DIR, sg_name, sg_idx)
+        x_hf = load_value(hf_dir, hf_name, hf_idx)
     except FileNotFoundError as e:
-        print(f"  -> file missing, skip: {e}")
+        logger.log(f"  -> HF file missing, skip: {e}")
+        return
+    try:
+        x_sg = load_value(sg_dir, sg_name, sg_idx)
+    except FileNotFoundError as e:
+        logger.log(f"  -> SG file missing, skip: {e}")
         return
 
     x_hf = normalize_for_compare(name, x_hf, side="hf")
@@ -190,60 +359,61 @@ def compare(name: str) -> None:
     x_hf = align_single_step(name, x_hf)
     x_sg = align_single_step(name, x_sg)
 
-    print("  hf shape/dtype:", tuple(x_hf.shape), x_hf.dtype)
-    print("  sg shape/dtype:", tuple(x_sg.shape), x_sg.dtype)
-    print("  shape_equal:", x_hf.shape == x_sg.shape)
-    print("  dtype_equal:", x_hf.dtype == x_sg.dtype)
+    logger.log(f"  hf shape/dtype: {tuple(x_hf.shape)} {x_hf.dtype}")
+    logger.log(f"  sg shape/dtype: {tuple(x_sg.shape)} {x_sg.dtype}")
+    logger.log(f"  shape_equal: {x_hf.shape == x_sg.shape}")
+    logger.log(f"  dtype_equal: {x_hf.dtype == x_sg.dtype}")
 
     if x_hf.shape != x_sg.shape:
-        print("  -> shape mismatch, skip")
+        logger.log("  -> shape mismatch, skip")
         return
 
     if x_hf.dtype == x_sg.dtype:
-        print("  torch.equal:", torch.equal(x_hf, x_sg))
+        logger.log(f"  torch.equal: {torch.equal(x_hf, x_sg)}")
     else:
-        print("  torch.equal: skip (dtype mismatch)")
+        logger.log("  torch.equal: skip (dtype mismatch)")
 
     if x_hf.dtype.is_floating_point or x_sg.dtype.is_floating_point:
-        diff = (x_hf.float() - x_sg.float()).abs()
-        print("  value_equal_after_cast:", bool(torch.equal(x_hf.float(), x_sg.float())))
-        print("  max_abs:", diff.max().item())
-        print("  mean_abs:", diff.mean().item())
+        x_hf_f = x_hf.float()
+        x_sg_f = x_sg.float()
+        diff = (x_hf_f - x_sg_f).abs()
+        logger.log(f"  value_equal_after_cast: {bool(torch.equal(x_hf_f, x_sg_f))}")
+        logger.log(f"  max_abs: {diff.max().item()}")
+        logger.log(f"  mean_abs: {diff.mean().item()}")
     else:
         neq = (x_hf != x_sg).sum().item()
-        print("  value_equal_after_cast:", neq == 0)
-        print("  neq_cnt:", neq)
+        logger.log(f"  value_equal_after_cast: {neq == 0}")
+        logger.log(f"  neq_cnt: {neq}")
 
 
 def main() -> None:
-    print("HF_DIR =", HF_DIR)
-    print("SG_DIR =", SG_DIR)
-    print("ALIGN_TO_SINGLE_STEP =", ALIGN_TO_SINGLE_STEP)
+    args = parse_args()
+    compare_names = FOCUS_TO_NAMES[args.focus]
 
-    for name in [
-        "input_ids_for_compare",
-        "embedding_output",
-        "layer0_positions",
-        "layer0_attn_input_raw",
-        "layer0_attn_after_input_layernorm_only",
-        "layer0_attn_input_after_prepare",
-        "layer0_hidden_in",
-        "layer0_attn_out",
-        "layer0_block_out",
-        "attn_input_last_layer",
-        "q_pre_norm",
-        "k_pre_norm",
-        "v_pre_norm",
-        "q_post_norm",
-        "k_post_norm",
-        "q_post_rope",
-        "k_post_rope",
-        "attn_context_before_o_proj",
-        "attn_out_last_layer",
-        "final_hidden_before_lm_head",
-        "lm_head_weight",
-    ]:
-        compare(name)
+    if args.hf_index_json is not None:
+        hf_index = _load_index_map(args.hf_index_json, DEFAULT_HF_INDEX)
+    elif args.auto_index:
+        hf_index = _discover_index_map(args.hf_dir, compare_names, "hf", DEFAULT_HF_INDEX)
+    else:
+        hf_index = dict(DEFAULT_HF_INDEX)
+
+    if args.sg_index_json is not None:
+        sg_index = _load_index_map(args.sg_index_json, DEFAULT_SG_INDEX)
+    elif args.auto_index:
+        sg_index = _discover_index_map(args.sg_dir, compare_names, "sg", DEFAULT_SG_INDEX)
+    else:
+        sg_index = dict(DEFAULT_SG_INDEX)
+
+    logger = Logger()
+    logger.log(f"HF_DIR = {args.hf_dir}")
+    logger.log(f"SG_DIR = {args.sg_dir}")
+    logger.log(f"ALIGN_TO_SINGLE_STEP = {ALIGN_TO_SINGLE_STEP}")
+    logger.log(f"FOCUS = {args.focus}")
+
+    for name in compare_names:
+        compare(logger, name, args.hf_dir, args.sg_dir, hf_index, sg_index)
+
+    logger.flush_to(args.output_txt)
 
 
 if __name__ == "__main__":
