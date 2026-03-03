@@ -158,7 +158,6 @@ SQUEEZE_BATCH1_NAMES = {
     "embedding_output",
     "layer0_positions",
     "layer0_attn_input_raw",
-    "layer0_attn_after_input_layernorm_only",
     "layer0_attn_input_after_prepare",
     "attn_input_last_layer",
     "q_pre_norm",
@@ -172,6 +171,54 @@ SQUEEZE_BATCH1_NAMES = {
     "attn_out_last_layer",
     "final_hidden_before_lm_head",
 }
+
+FILE_RE = re.compile(
+    r"^forward_pass_id=0___rank=0___name=(?P<name>.+)___dump_index=(?P<index>\d+)\.pt$"
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare HF and SGLang dumper tensors around the attention path."
+    )
+    parser.add_argument("--hf-dir", type=Path, default=None)
+    parser.add_argument("--sg-dir", type=Path, default=None)
+    parser.add_argument(
+        "--focus",
+        nargs="*",
+        default=[
+            "q_post_norm",
+            "k_post_norm",
+            "q_post_rope",
+            "k_post_rope",
+        ],
+        help="Names to compare. Defaults to the key norm/rope checkpoints.",
+    )
+    parser.add_argument(
+        "--list-latest",
+        action="store_true",
+        help="Print available dump directories under /tmp/dumper and exit.",
+    )
+    return parser.parse_args()
+
+
+def list_dump_dirs(root: Path) -> list[Path]:
+    return sorted(
+        [p for p in root.glob("sglang_dump_*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+    )
+
+
+def discover_index_map(dump_dir: Path) -> dict[str, int]:
+    index_map: dict[str, int] = {}
+    for path in dump_dir.glob("forward_pass_id=0___rank=0___name=*___dump_index=*.pt"):
+        match = FILE_RE.match(path.name)
+        if match is None:
+            continue
+        name = match.group("name")
+        index = int(match.group("index"))
+        index_map[name] = index
+    return index_map
 
 
 def parse_args() -> argparse.Namespace:
@@ -358,6 +405,8 @@ def compare(
     x_sg = normalize_for_compare(name, x_sg, side="sg")
     x_hf = align_single_step(name, x_hf)
     x_sg = align_single_step(name, x_sg)
+    x_hf = squeeze_single_step_tail(x_hf)
+    x_sg = squeeze_single_step_tail(x_sg)
 
     logger.log(f"  hf shape/dtype: {tuple(x_hf.shape)} {x_hf.dtype}")
     logger.log(f"  sg shape/dtype: {tuple(x_sg.shape)} {x_sg.dtype}")
