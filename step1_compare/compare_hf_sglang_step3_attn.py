@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import re
 
 import torch
-# prepare_attn -- deterministic done.
+
 # ====== 按你当前这轮实验日志更新 ======
-# HF dump (day0 脚本侧): partial_name=1772495566.2086942
-# SG dump (server 侧):   partial_name=1772495553.4705586
-HF_DIR = Path("/tmp/dumper/sglang_dump_1772495566.2086942")
-SG_DIR = Path("/tmp/dumper/sglang_dump_1772495553.4705586")
+# HF dump (day0 脚本侧): partial_name=1772504411.8622928
+# SG dump (server 侧):   partial_name=1772504398.6104689
+HF_DIR = Path("/tmp/dumper/sglang_dump_1772504411.8622928")
+SG_DIR = Path("/tmp/dumper/sglang_dump_1772504398.6104689")
 
 # ====== 按你的当前实验修改这些 index 映射 ======
 HF_INDEX = {
@@ -15,22 +16,41 @@ HF_INDEX = {
     "embedding_output": 2,
     "layer0_positions": 3,
     "layer0_attn_input_raw": 4,
-    # HF 这轮没有单独 dump 该点，使用 input_after_prepare 对齐
+    # HF 本轮没有单独 dump 该点，使用 attn_input_after_prepare 近似对齐
     "layer0_attn_after_input_layernorm_only": 5,
+    # 该名字在 HF 本轮会出现两次（历史点 + 新增按层点），固定取第一次
     "layer0_attn_input_after_prepare": 5,
-    "attn_input_last_layer": 6,
-    "q_pre_norm": 7,
-    "k_pre_norm": 8,
-    "v_pre_norm": 9,
-    # HF 这轮未产出这 4 个点，设为 -1 自动跳过
+    "layer0_hidden_component_after_postprocess": 7,
+    "layer0_decoder_output_full": 8,
+    "layer8_attn_input_after_prepare": 8,
+    "layer8_hidden_component_after_postprocess": 9,
+    "layer8_decoder_output_full": 10,
+    "layer16_attn_input_after_prepare": 10,
+    "layer16_hidden_component_after_postprocess": 11,
+    "layer16_decoder_output_full": 12,
+    "layer24_attn_input_after_prepare": 12,
+    "layer24_hidden_component_after_postprocess": 13,
+    "layer24_decoder_output_full": 14,
+    "layer32_attn_input_after_prepare": 14,
+    "layer32_hidden_component_after_postprocess": 15,
+    "layer32_decoder_output_full": 16,
+    # Qwen3-8B 本轮没有 layer40 的 dump，设为 -1 自动跳过
+    "layer40_attn_input_after_prepare": -1,
+    "layer40_hidden_component_after_postprocess": -1,
+    "layer40_decoder_output_full": -1,
+    "attn_input_last_layer": 17,
+    "q_pre_norm": 18,
+    "k_pre_norm": 19,
+    "v_pre_norm": 20,
+    # HF 本轮未产出这 4 个点，设为 -1 自动跳过
     "q_post_norm": -1,
     "k_post_norm": -1,
     "q_post_rope": -1,
     "k_post_rope": -1,
-    "attn_context_before_o_proj": 10,
-    "attn_out_last_layer": 11,
-    "final_hidden_before_lm_head": 12,
-    "lm_head_weight": 13,
+    "attn_context_before_o_proj": 21,
+    "attn_out_last_layer": 22,
+    "final_hidden_before_lm_head": 23,
+    "lm_head_weight": 24,
 }
 
 SG_INDEX = {
@@ -38,21 +58,39 @@ SG_INDEX = {
     "embedding_output": 2,
     "layer0_attn_input_raw": 3,
     "layer0_positions": 4,
-    # 5~8 是 rmsnorm_stage_*，主流程对应点从 9 开始
-    "layer0_attn_after_input_layernorm_only": 9,
-    "layer0_attn_input_after_prepare": 10,
-    "attn_input_last_layer": 11,
-    "q_pre_norm": 12,
-    "k_pre_norm": 13,
-    "v_pre_norm": 14,
-    "q_post_norm": 15,
-    "k_post_norm": 16,
-    "q_post_rope": 17,
-    "k_post_rope": 18,
-    "attn_context_before_o_proj": 19,
-    "attn_out_last_layer": 20,
-    "final_hidden_before_lm_head": 21,
-    "lm_head_weight": 22,
+    "layer0_attn_after_input_layernorm_only": 5,
+    # 该名字在 SG 本轮会出现两次（历史点 + 新增按层点），固定取第一次
+    "layer0_attn_input_after_prepare": 6,
+    "layer0_hidden_component_after_postprocess": 8,
+    "layer0_decoder_output_full": 9,
+    "layer8_attn_input_after_prepare": 9,
+    "layer8_hidden_component_after_postprocess": 10,
+    "layer8_decoder_output_full": 11,
+    "layer16_attn_input_after_prepare": 11,
+    "layer16_hidden_component_after_postprocess": 12,
+    "layer16_decoder_output_full": 13,
+    "layer24_attn_input_after_prepare": 13,
+    "layer24_hidden_component_after_postprocess": 14,
+    "layer24_decoder_output_full": 15,
+    "layer32_attn_input_after_prepare": 15,
+    "layer32_hidden_component_after_postprocess": 16,
+    "layer32_decoder_output_full": 17,
+    # Qwen3-8B 本轮没有 layer40 的 dump，设为 -1 自动跳过
+    "layer40_attn_input_after_prepare": -1,
+    "layer40_hidden_component_after_postprocess": -1,
+    "layer40_decoder_output_full": -1,
+    "attn_input_last_layer": 18,
+    "q_pre_norm": 19,
+    "k_pre_norm": 20,
+    "v_pre_norm": 21,
+    "q_post_norm": 22,
+    "k_post_norm": 23,
+    "q_post_rope": 24,
+    "k_post_rope": 25,
+    "attn_context_before_o_proj": 26,
+    "attn_out_last_layer": 27,
+    "final_hidden_before_lm_head": 28,
+    "lm_head_weight": 29,
 }
 
 # 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名
@@ -67,6 +105,24 @@ HF_NAME_OVERRIDE = {
 ALIGN_TO_SINGLE_STEP = True
 
 ALIGN_NAMES = {
+    "layer0_attn_input_after_prepare",
+    "layer0_hidden_component_after_postprocess",
+    "layer0_decoder_output_full",
+    "layer8_attn_input_after_prepare",
+    "layer8_hidden_component_after_postprocess",
+    "layer8_decoder_output_full",
+    "layer16_attn_input_after_prepare",
+    "layer16_hidden_component_after_postprocess",
+    "layer16_decoder_output_full",
+    "layer24_attn_input_after_prepare",
+    "layer24_hidden_component_after_postprocess",
+    "layer24_decoder_output_full",
+    "layer32_attn_input_after_prepare",
+    "layer32_hidden_component_after_postprocess",
+    "layer32_decoder_output_full",
+    "layer40_attn_input_after_prepare",
+    "layer40_hidden_component_after_postprocess",
+    "layer40_decoder_output_full",
     "attn_input_last_layer",
     "q_pre_norm",
     "k_pre_norm",
@@ -94,6 +150,23 @@ SQUEEZE_BATCH1_NAMES = {
     "layer0_attn_input_raw",
     "layer0_attn_after_input_layernorm_only",
     "layer0_attn_input_after_prepare",
+    "layer0_hidden_component_after_postprocess",
+    "layer0_decoder_output_full",
+    "layer8_attn_input_after_prepare",
+    "layer8_hidden_component_after_postprocess",
+    "layer8_decoder_output_full",
+    "layer16_attn_input_after_prepare",
+    "layer16_hidden_component_after_postprocess",
+    "layer16_decoder_output_full",
+    "layer24_attn_input_after_prepare",
+    "layer24_hidden_component_after_postprocess",
+    "layer24_decoder_output_full",
+    "layer32_attn_input_after_prepare",
+    "layer32_hidden_component_after_postprocess",
+    "layer32_decoder_output_full",
+    "layer40_attn_input_after_prepare",
+    "layer40_hidden_component_after_postprocess",
+    "layer40_decoder_output_full",
     "attn_input_last_layer",
     "q_pre_norm",
     "k_pre_norm",
@@ -112,6 +185,21 @@ def load_value(d: Path, name: str, idx: int) -> torch.Tensor:
     p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={idx}.pt"
     obj = torch.load(p, weights_only=False, map_location="cpu")
     return obj["value"] if isinstance(obj, dict) and "value" in obj else obj
+
+
+def resolve_index(d: Path, name: str, preferred_idx: int) -> int:
+    if preferred_idx > 0:
+        p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={preferred_idx}.pt"
+        if p.exists():
+            return preferred_idx
+    cands = sorted(
+        d.glob(f"forward_pass_id=0___rank=0___name={name}___dump_index=*.pt"),
+        key=lambda p: int(re.search(r"___dump_index=(\d+)\.pt$", p.name).group(1)),
+    )
+    if not cands:
+        return -1
+    m = re.search(r"___dump_index=(\d+)\.pt$", cands[0].name)
+    return int(m.group(1))
 
 
 def align_single_step(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -141,8 +229,8 @@ def normalize_for_compare(name: str, x: torch.Tensor, side: str) -> torch.Tensor
 
 
 def compare(name: str) -> None:
-    hf_idx = HF_INDEX[name]
-    sg_idx = SG_INDEX[name]
+    hf_idx = resolve_index(HF_DIR, HF_NAME_OVERRIDE.get(name, name), HF_INDEX[name])
+    sg_idx = resolve_index(SG_DIR, name, SG_INDEX[name])
     hf_name = HF_NAME_OVERRIDE.get(name, name)
     sg_name = name
 
@@ -196,6 +284,23 @@ def main() -> None:
         "layer0_attn_input_raw",
         "layer0_attn_after_input_layernorm_only",
         "layer0_attn_input_after_prepare",
+        "layer0_hidden_component_after_postprocess",
+        "layer0_decoder_output_full",
+        "layer8_attn_input_after_prepare",
+        "layer8_hidden_component_after_postprocess",
+        "layer8_decoder_output_full",
+        "layer16_attn_input_after_prepare",
+        "layer16_hidden_component_after_postprocess",
+        "layer16_decoder_output_full",
+        "layer24_attn_input_after_prepare",
+        "layer24_hidden_component_after_postprocess",
+        "layer24_decoder_output_full",
+        "layer32_attn_input_after_prepare",
+        "layer32_hidden_component_after_postprocess",
+        "layer32_decoder_output_full",
+        "layer40_attn_input_after_prepare",
+        "layer40_hidden_component_after_postprocess",
+        "layer40_decoder_output_full",
         "attn_input_last_layer",
         "q_pre_norm",
         "k_pre_norm",

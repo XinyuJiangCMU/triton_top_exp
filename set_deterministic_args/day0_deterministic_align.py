@@ -45,6 +45,7 @@ class CompareSummary:
 
 
 _dumper = None
+_HF_LAYER_PROBE_IDS = {0, 8, 16, 24, 32, 40}
 
 
 def _maybe_dump(name: str, value: torch.Tensor) -> None:
@@ -358,6 +359,8 @@ def hf_get_logprobs(
 
     attn_out_last_layer = None
     hook_handles = []
+    probe_layer_ids = _HF_LAYER_PROBE_IDS
+    self_attn_to_layer_id: dict[int, int] = {}
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
 
@@ -387,6 +390,12 @@ def hf_get_logprobs(
                     _maybe_dump("layer0_attn_input_after_prepare", _hf_slice(hs))
         except Exception:
             pass
+        try:
+            layer_id = self_attn_to_layer_id.get(id(_module))
+            if layer_id in probe_layer_ids:
+                _maybe_dump(f"layer{layer_id}_attn_input_after_prepare", _hf_slice(hs))
+        except Exception:
+            pass
         hs = hs.to(torch.bfloat16)
         if "hidden_states" in kwargs:
             new_kwargs = dict(kwargs)
@@ -395,6 +404,17 @@ def hf_get_logprobs(
         new_args = list(args)
         new_args[0] = hs
         return tuple(new_args), kwargs
+
+    def _qk_norm_pre_bf16(_module, args, kwargs):
+        if len(args) == 0 or not isinstance(args[0], torch.Tensor):
+            return None
+        x = args[0].to(torch.bfloat16)
+        return (x,) + tuple(args[1:]), kwargs
+
+    def _qk_norm_post_bf16(_module, args, kwargs, output):
+        if isinstance(output, torch.Tensor):
+            return output.to(torch.bfloat16)
+        return output
 
     def _mlp_pre_bf16(_module, args, kwargs):
         x = kwargs.get("hidden_states", kwargs.get("x", args[0] if len(args) > 0 else None))
@@ -431,8 +451,46 @@ def hf_get_logprobs(
             x = x.to(target_dtype)
         return (x,) + tuple(args[1:]), kwargs
 
+    def _make_layer_output_hook(layer_id: int):
+        def _capture_layer_output(_module, args, kwargs, output):
+            if layer_id not in probe_layer_ids:
+                return
+            try:
+                out = output[0] if isinstance(output, tuple) else output
+                if isinstance(out, torch.Tensor):
+                    _maybe_dump(
+                        f"layer{layer_id}_decoder_output_full",
+                        _hf_slice(out.to(torch.bfloat16)),
+                    )
+            except Exception:
+                pass
+
+        return _capture_layer_output
+
+    def _make_mlp_output_hook(layer_id: int):
+        def _capture_mlp_output(_module, args, kwargs, output):
+            if layer_id not in probe_layer_ids:
+                return
+            try:
+                out = output[0] if isinstance(output, tuple) else output
+                if isinstance(out, torch.Tensor):
+                    _maybe_dump(
+                        f"layer{layer_id}_hidden_component_after_postprocess",
+                        _hf_slice(out.to(torch.bfloat16)),
+                    )
+            except Exception:
+                pass
+
+        return _capture_mlp_output
+
     if hasattr(model, "model") and hasattr(model.model, "layers"):
-        for layer in model.model.layers:
+        for layer_id, layer in enumerate(model.model.layers):
+            if layer_id in probe_layer_ids:
+                hook_handles.append(
+                    layer.register_forward_hook(
+                        _make_layer_output_hook(layer_id), with_kwargs=True
+                    )
+                )
             for norm_name in ("input_layernorm", "post_attention_layernorm"):
                 norm_mod = getattr(layer, norm_name, None)
                 if norm_mod is not None:
@@ -443,11 +501,34 @@ def hf_get_logprobs(
                         norm_mod.register_forward_hook(_norm_post_fp32, with_kwargs=True)
                     )
             if hasattr(layer, "self_attn"):
+                self_attn_to_layer_id[id(layer.self_attn)] = layer_id
                 hook_handles.append(
                     layer.self_attn.register_forward_pre_hook(
                         _self_attn_pre_bf16, with_kwargs=True
                     )
                 )
+                if hasattr(layer.self_attn, "q_norm"):
+                    hook_handles.append(
+                        layer.self_attn.q_norm.register_forward_pre_hook(
+                            _qk_norm_pre_bf16, with_kwargs=True
+                        )
+                    )
+                    hook_handles.append(
+                        layer.self_attn.q_norm.register_forward_hook(
+                            _qk_norm_post_bf16, with_kwargs=True
+                        )
+                    )
+                if hasattr(layer.self_attn, "k_norm"):
+                    hook_handles.append(
+                        layer.self_attn.k_norm.register_forward_pre_hook(
+                            _qk_norm_pre_bf16, with_kwargs=True
+                        )
+                    )
+                    hook_handles.append(
+                        layer.self_attn.k_norm.register_forward_hook(
+                            _qk_norm_post_bf16, with_kwargs=True
+                        )
+                    )
                 if hasattr(layer.self_attn, "o_proj"):
                     hook_handles.append(
                         layer.self_attn.o_proj.register_forward_pre_hook(
@@ -455,6 +536,12 @@ def hf_get_logprobs(
                         )
                     )
             if hasattr(layer, "mlp"):
+                if layer_id in probe_layer_ids:
+                    hook_handles.append(
+                        layer.mlp.register_forward_hook(
+                            _make_mlp_output_hook(layer_id), with_kwargs=True
+                        )
+                    )
                 hook_handles.append(
                     layer.mlp.register_forward_pre_hook(
                         _mlp_pre_bf16, with_kwargs=True
