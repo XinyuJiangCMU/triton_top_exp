@@ -357,6 +357,7 @@ def hf_get_logprobs(
         return x
 
     attn_out_last_layer = None
+    layer0_attn_out = None
     hook_handles = []
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
@@ -385,6 +386,7 @@ def hf_get_logprobs(
                 first_layer = model.model.layers[0] if len(model.model.layers) > 0 else None
                 if first_layer is not None and getattr(first_layer, "self_attn", None) is _module:
                     _maybe_dump("layer0_attn_input_after_prepare", _hf_slice(hs))
+                    _maybe_dump("layer0_hidden_in", _hf_slice(hs))
         except Exception:
             pass
         hs = hs.to(torch.bfloat16)
@@ -481,6 +483,35 @@ def hf_get_logprobs(
 
         hook_handles.append(
             first_layer.register_forward_pre_hook(_capture_layer0_raw, with_kwargs=True)
+        )
+
+        def _capture_layer0_attn_output(_module, args, kwargs, output):
+            nonlocal layer0_attn_out
+            try:
+                layer0_attn_out = output[0] if isinstance(output, tuple) else output
+                if layer0_attn_out is not None:
+                    _maybe_dump("layer0_attn_out", _hf_slice(layer0_attn_out))
+            except Exception:
+                pass
+
+        hook_handles.append(
+            first_layer.self_attn.register_forward_hook(
+                _capture_layer0_attn_output, with_kwargs=True
+            )
+        )
+
+        def _capture_layer0_block_output(_module, args, kwargs, output):
+            try:
+                hidden_states = output[0] if isinstance(output, tuple) else output
+                if hidden_states is not None:
+                    _maybe_dump("layer0_block_out", _hf_slice(hidden_states))
+            except Exception:
+                pass
+
+        hook_handles.append(
+            first_layer.register_forward_hook(
+                _capture_layer0_block_output, with_kwargs=True
+            )
         )
 
         # layer0_attn_input_after_prepare is captured inside _self_attn_pre_bf16

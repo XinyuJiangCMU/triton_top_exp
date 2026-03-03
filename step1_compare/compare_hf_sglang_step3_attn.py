@@ -4,53 +4,63 @@ from pathlib import Path
 import torch
 # prepare_attn -- deterministic done.
 # ====== 按你当前这轮实验日志更新 ======
-# HF dump (day0 脚本侧): partial_name=1772516560.4452999
-# SG dump (server 侧):   partial_name=1772516547.9791403
-HF_DIR = Path("/tmp/dumper/sglang_dump_1772516560.4452999")
-SG_DIR = Path("/tmp/dumper/sglang_dump_1772516547.9791403")
+# HF dump (day0 脚本侧): partial_name=1772518054.0836897
+# SG dump (server 侧):   partial_name=1772518041.371588
+HF_DIR = Path("/tmp/dumper/sglang_dump_1772518054.0836897")
+SG_DIR = Path("/tmp/dumper/sglang_dump_1772518041.371588")
 
 
 # ====== 按你的当前实验修改这些 index 映射 ======
 HF_INDEX = {
+    "layer0_hidden_in": 6,
+    "layer0_attn_out": 7,
+    "layer0_block_out": 8,
     "input_ids_for_compare": 1,
     "embedding_output": 2,
     "layer0_positions": 3,
     "layer0_attn_input_raw": 4,
     "layer0_attn_after_input_layernorm_only": 5,
     "layer0_attn_input_after_prepare": 5,
-    "attn_input_last_layer": 6,
-    "q_pre_norm": 7,
-    "k_pre_norm": 8,
-    "v_pre_norm": 9,
+    "attn_input_last_layer": 9,
+    "q_pre_norm": 10,
+    "k_pre_norm": 11,
+    "v_pre_norm": 12,
     "q_post_norm": -1,
     "k_post_norm": -1,
     "q_post_rope": -1,
     "k_post_rope": -1,
-    "attn_context_before_o_proj": 10,
-    "attn_out_last_layer": 11,
-    "final_hidden_before_lm_head": 12,
-    "lm_head_weight": 13,
+    "attn_context_before_o_proj": 13,
+    "attn_out_last_layer": 14,
+    "final_hidden_before_lm_head": 15,
+    "lm_head_weight": 16,
 }
 
 SG_INDEX = {
+    "layer0_hidden_in": 7,
+    "layer0_q_pre_norm": 8,
+    "layer0_k_pre_norm": 9,
+    "layer0_v_pre_norm": 10,
+    "layer0_attn_context_before_o_proj": 11,
+    "layer0_attn_out": 12,
+    "layer0_block_out": 13,
     "input_ids_for_compare": 1,
     "embedding_output": 2,
     "layer0_attn_input_raw": 3,
     "layer0_positions": 4,
     "layer0_attn_after_input_layernorm_only": 5,
     "layer0_attn_input_after_prepare": 6,
-    "attn_input_last_layer": 7,
-    "q_pre_norm": 8,
-    "k_pre_norm": 9,
-    "v_pre_norm": 10,
-    "q_post_norm": 11,
-    "k_post_norm": 12,
-    "q_post_rope": 13,
-    "k_post_rope": 14,
-    "attn_context_before_o_proj": 15,
-    "attn_out_last_layer": 16,
-    "final_hidden_before_lm_head": 17,
-    "lm_head_weight": 18,
+    "attn_input_last_layer": 14,
+    "q_pre_norm": 15,
+    "k_pre_norm": 16,
+    "v_pre_norm": 17,
+    "q_post_norm": 18,
+    "k_post_norm": 19,
+    "q_post_rope": 20,
+    "k_post_rope": 21,
+    "attn_context_before_o_proj": 22,
+    "attn_out_last_layer": 23,
+    "final_hidden_before_lm_head": 24,
+    "lm_head_weight": 25,
 }
 
 # 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名
@@ -65,6 +75,9 @@ HF_NAME_OVERRIDE = {
 ALIGN_TO_SINGLE_STEP = True
 
 ALIGN_NAMES = {
+    "layer0_hidden_in",
+    "layer0_attn_out",
+    "layer0_block_out",
     "attn_input_last_layer",
     "q_pre_norm",
     "k_pre_norm",
@@ -86,6 +99,9 @@ HF_DROP_LAST_TOKEN_NAMES = {
 }
 
 SQUEEZE_BATCH1_NAMES = {
+    "layer0_hidden_in",
+    "layer0_attn_out",
+    "layer0_block_out",
     "input_ids_for_compare",
     "embedding_output",
     "layer0_positions",
@@ -106,8 +122,21 @@ SQUEEZE_BATCH1_NAMES = {
 }
 
 
+def _extract_dump_index(p: Path) -> int:
+    return int(p.stem.split("___dump_index=")[1])
+
+
 def load_value(d: Path, name: str, idx: int) -> torch.Tensor:
-    p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={idx}.pt"
+    if idx > 0:
+        p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={idx}.pt"
+    else:
+        matches = sorted(
+            d.glob(f"forward_pass_id=0___rank=0___name={name}___dump_index=*.pt"),
+            key=_extract_dump_index,
+        )
+        if not matches:
+            raise FileNotFoundError(f"missing dump for {name} under {d}")
+        p = matches[0]
     obj = torch.load(p, weights_only=False, map_location="cpu")
     return obj["value"] if isinstance(obj, dict) and "value" in obj else obj
 
@@ -188,6 +217,9 @@ def main() -> None:
     print("ALIGN_TO_SINGLE_STEP =", ALIGN_TO_SINGLE_STEP)
 
     for name in [
+        "layer0_hidden_in",
+        "layer0_attn_out",
+        "layer0_block_out",
         "input_ids_for_compare",
         "embedding_output",
         "layer0_positions",
