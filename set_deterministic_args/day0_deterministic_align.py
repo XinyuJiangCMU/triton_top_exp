@@ -45,6 +45,8 @@ class CompareSummary:
 
 
 _dumper = None
+# _HF_LAYER_PROBE_IDS = {0, 8, 16, 24, 32, 40}
+_HF_LAYER_PROBE_IDS = {0}
 
 
 def _maybe_dump(name: str, value: torch.Tensor) -> None:
@@ -340,12 +342,12 @@ def hf_get_logprobs(
     )
     model.eval()
     ids = torch.tensor([token_ids], dtype=torch.long, device=model.device)
-    _maybe_dump("input_ids_for_compare", ids)
+    # _maybe_dump("input_ids_for_compare", ids)
     input_embeds = None
     try:
         # Align with SGLang rl_on_policy path: feed FP32 embeddings into pre-attn path.
         input_embeds = model.get_input_embeddings()(ids).float()
-        _maybe_dump("embedding_output", input_embeds)
+        # _maybe_dump("embedding_output", input_embeds)
     except Exception:
         pass
 
@@ -364,6 +366,8 @@ def hf_get_logprobs(
     # Align HF compute dtype with SGLang:
     # 1) Keep pre-attn norm/residual path in FP32.
     # 2) Cast hidden_states to BF16 right before self_attn.
+    self_attn_to_layer_id: dict[int, int] = {}
+    o_proj_to_layer_id: dict[int, int] = {}
     def _norm_pre_fp32(_module, args, kwargs):
         if len(args) > 0 and isinstance(args[0], torch.Tensor):
             new_args = (args[0].float(),) + tuple(args[1:])
@@ -379,12 +383,11 @@ def hf_get_logprobs(
         hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
         if hs is None or not isinstance(hs, torch.Tensor):
             return None
-        # Capture "after prepare_attn, before self_attn bf16 cast" for layer-0.
+        # Capture "after prepare_attn, before self_attn bf16 cast" for probe layers.
         try:
-            if hasattr(model, "model") and hasattr(model.model, "layers"):
-                first_layer = model.model.layers[0] if len(model.model.layers) > 0 else None
-                if first_layer is not None and getattr(first_layer, "self_attn", None) is _module:
-                    _maybe_dump("layer0_attn_input_after_prepare", _hf_slice(hs))
+            layer_id = self_attn_to_layer_id.get(id(_module))
+            if layer_id in _HF_LAYER_PROBE_IDS:
+                _maybe_dump(f"layer{layer_id}_attn_input_after_prepare", _hf_slice(hs))
         except Exception:
             pass
         hs = hs.to(torch.bfloat16)
@@ -417,6 +420,12 @@ def hf_get_logprobs(
         if len(args) == 0 or not isinstance(args[0], torch.Tensor):
             return None
         x = args[0]
+        try:
+            layer_id = o_proj_to_layer_id.get(id(_module))
+            if layer_id == 0:
+                _maybe_dump("layer0_attn_context_before_o_proj", _hf_slice(x))
+        except Exception:
+            pass
         target_dtype = _module.weight.dtype
         if x.dtype != target_dtype:
             x = x.to(target_dtype)
@@ -431,8 +440,41 @@ def hf_get_logprobs(
             x = x.to(target_dtype)
         return (x,) + tuple(args[1:]), kwargs
 
+    def _make_mlp_output_hook(layer_id: int):
+        def _capture_mlp_output(_module, args, kwargs, output):
+            try:
+                hidden_component = output[0] if isinstance(output, tuple) else output
+                if isinstance(hidden_component, torch.Tensor):
+                    if layer_id == 0:
+                        _maybe_dump(
+                            "layer0_mlp_output",
+                            _hf_slice(hidden_component.to(torch.bfloat16)),
+                        )
+                    _maybe_dump(
+                        f"layer{layer_id}_hidden_component_after_postprocess",
+                        _hf_slice(hidden_component.to(torch.bfloat16)),
+                    )
+            except Exception:
+                pass
+
+        return _capture_mlp_output
+
+    def _make_layer_output_hook(layer_id: int):
+        def _capture_layer_output(_module, args, kwargs, output):
+            try:
+                decoder_output = output[0] if isinstance(output, tuple) else output
+                if isinstance(decoder_output, torch.Tensor):
+                    _maybe_dump(
+                        f"layer{layer_id}_decoder_output_full",
+                        _hf_slice(decoder_output.float()),
+                    )
+            except Exception:
+                pass
+
+        return _capture_layer_output
+
     if hasattr(model, "model") and hasattr(model.model, "layers"):
-        for layer in model.model.layers:
+        for layer_id, layer in enumerate(model.model.layers):
             for norm_name in ("input_layernorm", "post_attention_layernorm"):
                 norm_mod = getattr(layer, norm_name, None)
                 if norm_mod is not None:
@@ -443,12 +485,14 @@ def hf_get_logprobs(
                         norm_mod.register_forward_hook(_norm_post_fp32, with_kwargs=True)
                     )
             if hasattr(layer, "self_attn"):
+                self_attn_to_layer_id[id(layer.self_attn)] = layer_id
                 hook_handles.append(
                     layer.self_attn.register_forward_pre_hook(
                         _self_attn_pre_bf16, with_kwargs=True
                     )
                 )
                 if hasattr(layer.self_attn, "o_proj"):
+                    o_proj_to_layer_id[id(layer.self_attn.o_proj)] = layer_id
                     hook_handles.append(
                         layer.self_attn.o_proj.register_forward_pre_hook(
                             _o_proj_pre_cast, with_kwargs=True
@@ -458,6 +502,18 @@ def hf_get_logprobs(
                 hook_handles.append(
                     layer.mlp.register_forward_pre_hook(
                         _mlp_pre_bf16, with_kwargs=True
+                    )
+                )
+                if layer_id in _HF_LAYER_PROBE_IDS:
+                    hook_handles.append(
+                        layer.mlp.register_forward_hook(
+                            _make_mlp_output_hook(layer_id), with_kwargs=True
+                        )
+                    )
+            if layer_id in _HF_LAYER_PROBE_IDS:
+                hook_handles.append(
+                    layer.register_forward_hook(
+                        _make_layer_output_hook(layer_id), with_kwargs=True
                     )
                 )
         if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
@@ -485,6 +541,155 @@ def hf_get_logprobs(
 
         # layer0_attn_input_after_prepare is captured inside _self_attn_pre_bf16
         # before bf16 cast, to match SGLang's semantic timing.
+        def _capture_layer0_after_attn_residual_add(_module, args, kwargs):
+            try:
+                hs = args[0] if len(args) > 0 else kwargs.get("hidden_states", None)
+                if isinstance(hs, torch.Tensor):
+                    _maybe_dump("layer0_after_attn_residual_add", _hf_slice(hs))
+            except Exception:
+                pass
+
+        def _capture_layer0_post_attn_ln_output(_module, args, kwargs, output):
+            try:
+                out = output[0] if isinstance(output, tuple) else output
+                if isinstance(out, torch.Tensor):
+                    _maybe_dump("layer0_post_attention_layernorm_output", _hf_slice(out))
+            except Exception:
+                pass
+
+        if hasattr(first_layer, "post_attention_layernorm"):
+            hook_handles.append(
+                first_layer.post_attention_layernorm.register_forward_pre_hook(
+                    _capture_layer0_after_attn_residual_add, with_kwargs=True
+                )
+            )
+            hook_handles.append(
+                first_layer.post_attention_layernorm.register_forward_hook(
+                    _capture_layer0_post_attn_ln_output, with_kwargs=True
+                )
+            )
+
+        def _capture_layer0_attn_output(_module, args, kwargs, output):
+            try:
+                attn_out = output[0] if isinstance(output, tuple) else output
+                if isinstance(attn_out, torch.Tensor):
+                    _maybe_dump("layer0_attn_out_after_o_proj", _hf_slice(attn_out))
+
+                hidden_states = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+                if hidden_states is None or not isinstance(hidden_states, torch.Tensor):
+                    return
+
+                if hasattr(_module, "q_proj") and hasattr(_module, "k_proj") and hasattr(_module, "v_proj"):
+                    q = _module.q_proj(hidden_states)
+                    k = _module.k_proj(hidden_states)
+                    v = _module.v_proj(hidden_states)
+                    _maybe_dump("layer0_q_pre_norm", _hf_slice(q))
+                    _maybe_dump("layer0_k_pre_norm", _hf_slice(k))
+                    _maybe_dump("layer0_v_pre_norm", _hf_slice(v))
+
+                    qn, kn = q, k
+                    if hasattr(_module, "q_norm") and hasattr(_module, "k_norm"):
+                        try:
+                            num_heads = getattr(_module, "num_heads", None)
+                            num_kv_heads = getattr(_module, "num_key_value_heads", num_heads)
+                            head_dim = getattr(_module, "head_dim", None)
+                            if (
+                                num_heads is not None
+                                and num_kv_heads is not None
+                                and head_dim is not None
+                            ):
+                                qn = _module.q_norm(
+                                    q.view(q.shape[0], q.shape[1], num_heads, head_dim)
+                                ).reshape_as(q)
+                                kn = _module.k_norm(
+                                    k.view(q.shape[0], q.shape[1], num_kv_heads, head_dim)
+                                ).reshape_as(k)
+                                _maybe_dump("layer0_q_post_norm", _hf_slice(qn))
+                                _maybe_dump("layer0_k_post_norm", _hf_slice(kn))
+                            else:
+                                print(
+                                    "[HF_DEBUG] skip layer0_q/k_post_norm: "
+                                    f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+                                )
+                        except Exception as norm_e:
+                            print(f"[HF_DEBUG] layer0_q/k_post_norm failed: {norm_e!r}")
+                    else:
+                        print("[HF_DEBUG] skip layer0_q/k_post_norm: q_norm/k_norm missing")
+
+                    # Best-effort rope reconstruction for layer0:
+                    # prefer explicit position_embeddings; fallback to module rotary_emb + position_ids.
+                    rope_done = False
+                    try:
+                        num_heads = getattr(_module, "num_heads", None)
+                        num_kv_heads = getattr(_module, "num_key_value_heads", num_heads)
+                        head_dim = getattr(_module, "head_dim", None)
+                        if (
+                            num_heads is not None
+                            and num_kv_heads is not None
+                            and head_dim is not None
+                        ):
+                            qh = qn.view(qn.shape[0], qn.shape[1], num_heads, head_dim).transpose(1, 2)
+                            kh = kn.view(kn.shape[0], kn.shape[1], num_kv_heads, head_dim).transpose(1, 2)
+
+                            cos = sin = None
+                            position_embeddings = kwargs.get("position_embeddings", None)
+                            if (
+                                isinstance(position_embeddings, (tuple, list))
+                                and len(position_embeddings) >= 2
+                            ):
+                                cos, sin = position_embeddings[0], position_embeddings[1]
+                            else:
+                                position_ids = kwargs.get("position_ids", None)
+                                rotary_emb = getattr(_module, "rotary_emb", None)
+                                if rotary_emb is not None and position_ids is not None:
+                                    try:
+                                        cos, sin = rotary_emb(qh, position_ids)
+                                    except Exception as rope_cache_e:
+                                        print(
+                                            f"[HF_DEBUG] layer0 rope cache build failed: {rope_cache_e!r}"
+                                        )
+
+                            if cos is not None and sin is not None:
+                                apply_rotary_pos_emb = None
+                                try:
+                                    from transformers.models.qwen3.modeling_qwen3 import (
+                                        apply_rotary_pos_emb as _apply_rotary_pos_emb,
+                                    )
+
+                                    apply_rotary_pos_emb = _apply_rotary_pos_emb
+                                except Exception:
+                                    try:
+                                        from transformers.models.qwen2.modeling_qwen2 import (
+                                            apply_rotary_pos_emb as _apply_rotary_pos_emb,
+                                        )
+
+                                        apply_rotary_pos_emb = _apply_rotary_pos_emb
+                                    except Exception as import_e:
+                                        print(
+                                            f"[HF_DEBUG] cannot import apply_rotary_pos_emb: {import_e!r}"
+                                        )
+
+                                if apply_rotary_pos_emb is not None:
+                                    qh2, kh2 = apply_rotary_pos_emb(qh, kh, cos, sin)
+                                    q_rope = qh2.transpose(1, 2).reshape_as(qn)
+                                    k_rope = kh2.transpose(1, 2).reshape_as(kn)
+                                    _maybe_dump("layer0_q_post_rope", _hf_slice(q_rope))
+                                    _maybe_dump("layer0_k_post_rope", _hf_slice(k_rope))
+                                    rope_done = True
+                    except Exception as rope_e:
+                        print(f"[HF_DEBUG] layer0_q/k_post_rope failed: {rope_e!r}")
+
+                    if not rope_done:
+                        print("[HF_DEBUG] skip layer0_q/k_post_rope: rope inputs unavailable")
+            except Exception as capture_e:
+                print(f"[HF_DEBUG] _capture_layer0_attn_output failed: {capture_e!r}")
+
+        if hasattr(first_layer, "self_attn"):
+            hook_handles.append(
+                first_layer.self_attn.register_forward_hook(
+                    _capture_layer0_attn_output, with_kwargs=True
+                )
+            )
 
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
         last_layer = model.model.layers[-1]
