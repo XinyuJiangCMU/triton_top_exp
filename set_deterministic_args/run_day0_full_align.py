@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -110,6 +111,10 @@ def write_text(path: Path, text: str) -> None:
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def shell_join(cmd: list[str]) -> str:
+    return shlex.join(cmd)
 
 
 def _prefix_writer(prefix: str, line: str) -> str:
@@ -398,6 +403,7 @@ def main() -> None:
     server_log = run_dir / "server_stdout.txt"
     day0_log = run_dir / "day0_stdout.txt"
     compare_log = run_dir / "compare_stdout.txt"
+    commands_txt = run_dir / "commands.txt"
     hf_dir_txt = run_dir / "hf_dir.txt"
     sg_dir_txt = run_dir / "sg_dir.txt"
     hf_index_json = run_dir / "hf_index.json"
@@ -406,6 +412,23 @@ def main() -> None:
 
     server_cmd = build_server_cmd(args)
     day0_cmd = build_day0_cmd(args)
+
+    write_text(
+        commands_txt,
+        "\n".join(
+            [
+                "[server]",
+                shell_join(server_cmd),
+                "",
+                "[day0]",
+                shell_join(day0_cmd),
+                "",
+                "[compare]",
+                "<pending until hf/sg dirs and index json are resolved>",
+                "",
+            ]
+        ),
+    )
 
     server_env = make_env(
         args.server_gpu,
@@ -458,6 +481,22 @@ def main() -> None:
         write_json(sg_index_json, sg_index)
 
         compare_cmd = build_compare_cmd(args.compare_script, hf_dir, sg_dir, hf_index_json, sg_index_json)
+        write_text(
+            commands_txt,
+            "\n".join(
+                [
+                    "[server]",
+                    shell_join(server_cmd),
+                    "",
+                    "[day0]",
+                    shell_join(day0_cmd),
+                    "",
+                    "[compare]",
+                    shell_join(compare_cmd),
+                    "",
+                ]
+            ),
+        )
         compare_env = os.environ.copy()
         compare_env["PYTHONPATH"] = build_pythonpath()
         compare_returncode = run_cmd_with_tee(
@@ -513,6 +552,7 @@ def main() -> None:
     print(f"server_log: {server_log}")
     print(f"day0_log: {day0_log}")
     print(f"compare_log: {compare_log}")
+    print(f"commands_txt: {commands_txt}")
     print(f"hf_dir: {hf_dir}")
     print(f"sg_dir: {sg_dir}")
     print(f"hf_index_json: {hf_index_json}")
