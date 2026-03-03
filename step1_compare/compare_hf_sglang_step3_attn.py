@@ -4,9 +4,9 @@ from pathlib import Path
 import torch
 # prepare_attn -- deterministic done.
 # ====== 按你当前这轮实验日志更新 ======
-# HF dump (day0 脚本侧): partial_name=1772518054.0836897
+# HF dump (day0 脚本侧): partial_name=1772518691.2323422
 # SG dump (server 侧):   partial_name=1772518041.371588
-HF_DIR = Path("/tmp/dumper/sglang_dump_1772518054.0836897")
+HF_DIR = Path("/tmp/dumper/sglang_dump_1772518691.2323422")
 SG_DIR = Path("/tmp/dumper/sglang_dump_1772518041.371588")
 
 
@@ -36,31 +36,31 @@ HF_INDEX = {
 }
 
 SG_INDEX = {
-    "layer0_hidden_in": 7,
-    "layer0_q_pre_norm": 8,
-    "layer0_k_pre_norm": 9,
-    "layer0_v_pre_norm": 10,
-    "layer0_attn_context_before_o_proj": 11,
-    "layer0_attn_out": 12,
-    "layer0_block_out": 13,
-    "input_ids_for_compare": 1,
-    "embedding_output": 2,
-    "layer0_attn_input_raw": 3,
-    "layer0_positions": 4,
-    "layer0_attn_after_input_layernorm_only": 5,
-    "layer0_attn_input_after_prepare": 6,
-    "attn_input_last_layer": 14,
-    "q_pre_norm": 15,
-    "k_pre_norm": 16,
-    "v_pre_norm": 17,
-    "q_post_norm": 18,
-    "k_post_norm": 19,
-    "q_post_rope": 20,
-    "k_post_rope": 21,
-    "attn_context_before_o_proj": 22,
-    "attn_out_last_layer": 23,
-    "final_hidden_before_lm_head": 24,
-    "lm_head_weight": 25,
+    "layer0_hidden_in": 64,
+    "layer0_q_pre_norm": 65,
+    "layer0_k_pre_norm": 66,
+    "layer0_v_pre_norm": 67,
+    "layer0_attn_context_before_o_proj": 68,
+    "layer0_attn_out": 69,
+    "layer0_block_out": 70,
+    "input_ids_for_compare": 58,
+    "embedding_output": 59,
+    "layer0_attn_input_raw": 60,
+    "layer0_positions": 61,
+    "layer0_attn_after_input_layernorm_only": 62,
+    "layer0_attn_input_after_prepare": 63,
+    "attn_input_last_layer": 71,
+    "q_pre_norm": 72,
+    "k_pre_norm": 73,
+    "v_pre_norm": 74,
+    "q_post_norm": 75,
+    "k_post_norm": 76,
+    "q_post_rope": 77,
+    "k_post_rope": 78,
+    "attn_context_before_o_proj": 79,
+    "attn_out_last_layer": 80,
+    "final_hidden_before_lm_head": 81,
+    "lm_head_weight": -1,
 }
 
 # 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名

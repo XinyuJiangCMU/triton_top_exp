@@ -343,8 +343,7 @@ def hf_get_logprobs(
     _maybe_dump("input_ids_for_compare", ids)
     input_embeds = None
     try:
-        # Align with SGLang rl_on_policy path: feed FP32 embeddings into pre-attn path.
-        input_embeds = model.get_input_embeddings()(ids).float()
+        input_embeds = model.get_input_embeddings()(ids)
         _maybe_dump("embedding_output", input_embeds)
     except Exception:
         pass
@@ -362,20 +361,6 @@ def hf_get_logprobs(
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
 
-    # Align HF compute dtype with SGLang:
-    # 1) Keep pre-attn norm/residual path in FP32.
-    # 2) Cast hidden_states to BF16 right before self_attn.
-    def _norm_pre_fp32(_module, args, kwargs):
-        if len(args) > 0 and isinstance(args[0], torch.Tensor):
-            new_args = (args[0].float(),) + tuple(args[1:])
-            return new_args, kwargs
-        return None
-
-    def _norm_post_fp32(_module, args, kwargs, output):
-        if isinstance(output, torch.Tensor):
-            return output.float()
-        return output
-
     def _self_attn_pre_bf16(_module, args, kwargs):
         hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
         if hs is None or not isinstance(hs, torch.Tensor):
@@ -386,7 +371,7 @@ def hf_get_logprobs(
                 first_layer = model.model.layers[0] if len(model.model.layers) > 0 else None
                 if first_layer is not None and getattr(first_layer, "self_attn", None) is _module:
                     _maybe_dump("layer0_attn_input_after_prepare", _hf_slice(hs))
-                    _maybe_dump("layer0_hidden_in", _hf_slice(hs))
+                    _maybe_dump("layer0_hidden_in", _hf_slice(hs.to(torch.bfloat16)))
         except Exception:
             pass
         hs = hs.to(torch.bfloat16)
@@ -435,15 +420,6 @@ def hf_get_logprobs(
 
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         for layer in model.model.layers:
-            for norm_name in ("input_layernorm", "post_attention_layernorm"):
-                norm_mod = getattr(layer, norm_name, None)
-                if norm_mod is not None:
-                    hook_handles.append(
-                        norm_mod.register_forward_pre_hook(_norm_pre_fp32, with_kwargs=True)
-                    )
-                    hook_handles.append(
-                        norm_mod.register_forward_hook(_norm_post_fp32, with_kwargs=True)
-                    )
             if hasattr(layer, "self_attn"):
                 hook_handles.append(
                     layer.self_attn.register_forward_pre_hook(
@@ -462,12 +438,12 @@ def hf_get_logprobs(
                         _mlp_pre_bf16, with_kwargs=True
                     )
                 )
-        if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
-            hook_handles.append(
-                model.lm_head.register_forward_pre_hook(
-                    _lm_head_pre_cast, with_kwargs=True
-                )
+    if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+        hook_handles.append(
+            model.lm_head.register_forward_pre_hook(
+                _lm_head_pre_cast, with_kwargs=True
             )
+        )
 
     # Layer-0 pre-attention probes.
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
@@ -504,7 +480,10 @@ def hf_get_logprobs(
             try:
                 hidden_states = output[0] if isinstance(output, tuple) else output
                 if hidden_states is not None:
-                    _maybe_dump("layer0_block_out", _hf_slice(hidden_states))
+                    _maybe_dump(
+                        "layer0_block_out",
+                        _hf_slice(hidden_states.to(torch.bfloat16)),
+                    )
             except Exception:
                 pass
 
