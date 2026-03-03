@@ -343,7 +343,8 @@ def hf_get_logprobs(
     _maybe_dump("input_ids_for_compare", ids)
     input_embeds = None
     try:
-        input_embeds = model.get_input_embeddings()(ids)
+        # Align with SGLang rl_on_policy path: feed FP32 embeddings into pre-attn path.
+        input_embeds = model.get_input_embeddings()(ids).float()
         _maybe_dump("embedding_output", input_embeds)
     except Exception:
         pass
@@ -360,6 +361,17 @@ def hf_get_logprobs(
     hook_handles = []
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
+
+    def _norm_pre_fp32(_module, args, kwargs):
+        if len(args) > 0 and isinstance(args[0], torch.Tensor):
+            new_args = (args[0].float(),) + tuple(args[1:])
+            return new_args, kwargs
+        return None
+
+    def _norm_post_fp32(_module, args, kwargs, output):
+        if isinstance(output, torch.Tensor):
+            return output.float()
+        return output
 
     def _self_attn_pre_bf16(_module, args, kwargs):
         hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
@@ -420,6 +432,19 @@ def hf_get_logprobs(
 
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         for layer in model.model.layers:
+            for norm_name in ("input_layernorm", "post_attention_layernorm"):
+                norm_mod = getattr(layer, norm_name, None)
+                if norm_mod is not None:
+                    hook_handles.append(
+                        norm_mod.register_forward_pre_hook(
+                            _norm_pre_fp32, with_kwargs=True
+                        )
+                    )
+                    hook_handles.append(
+                        norm_mod.register_forward_hook(
+                            _norm_post_fp32, with_kwargs=True
+                        )
+                    )
             if hasattr(layer, "self_attn"):
                 hook_handles.append(
                     layer.self_attn.register_forward_pre_hook(
