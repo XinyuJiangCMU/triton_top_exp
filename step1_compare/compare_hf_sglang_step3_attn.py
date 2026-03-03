@@ -192,6 +192,8 @@ def compare(name: str) -> None:
 
     print("  hf shape/dtype:", tuple(x_hf.shape), x_hf.dtype)
     print("  sg shape/dtype:", tuple(x_sg.shape), x_sg.dtype)
+    print("  shape_equal:", x_hf.shape == x_sg.shape)
+    print("  dtype_equal:", x_hf.dtype == x_sg.dtype)
 
     if x_hf.shape != x_sg.shape:
         print("  -> shape mismatch, skip")
@@ -200,14 +202,16 @@ def compare(name: str) -> None:
     if x_hf.dtype == x_sg.dtype:
         print("  torch.equal:", torch.equal(x_hf, x_sg))
     else:
-        print("  torch.equal: False (dtype mismatch)")
+        print("  torch.equal: skip (dtype mismatch)")
 
     if x_hf.dtype.is_floating_point or x_sg.dtype.is_floating_point:
         diff = (x_hf.float() - x_sg.float()).abs()
+        print("  value_equal_after_cast:", bool(torch.equal(x_hf.float(), x_sg.float())))
         print("  max_abs:", diff.max().item())
         print("  mean_abs:", diff.mean().item())
     else:
         neq = (x_hf != x_sg).sum().item()
+        print("  value_equal_after_cast:", neq == 0)
         print("  neq_cnt:", neq)
 
 
@@ -217,15 +221,15 @@ def main() -> None:
     print("ALIGN_TO_SINGLE_STEP =", ALIGN_TO_SINGLE_STEP)
 
     for name in [
-        "layer0_hidden_in",
-        "layer0_attn_out",
-        "layer0_block_out",
         "input_ids_for_compare",
         "embedding_output",
         "layer0_positions",
         "layer0_attn_input_raw",
         "layer0_attn_after_input_layernorm_only",
         "layer0_attn_input_after_prepare",
+        "layer0_hidden_in",
+        "layer0_attn_out",
+        "layer0_block_out",
         "attn_input_last_layer",
         "q_pre_norm",
         "k_pre_norm",
