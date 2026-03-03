@@ -4,10 +4,11 @@ from pathlib import Path
 import torch
 # prepare_attn -- deterministic done.
 # ====== 按你当前这轮实验日志更新 ======
-# HF dump (day0 脚本侧): partial_name=1772495566.2086942
-# SG dump (server 侧):   partial_name=1772495553.4705586
-HF_DIR = Path("/tmp/dumper/sglang_dump_1772495566.2086942")
-SG_DIR = Path("/tmp/dumper/sglang_dump_1772495553.4705586")
+# HF dump (day0 脚本侧): partial_name=1772516560.4452999
+# SG dump (server 侧):   partial_name=1772516547.9791403
+HF_DIR = Path("/tmp/dumper/sglang_dump_1772516560.4452999")
+SG_DIR = Path("/tmp/dumper/sglang_dump_1772516547.9791403")
+
 
 # ====== 按你的当前实验修改这些 index 映射 ======
 HF_INDEX = {
@@ -15,14 +16,12 @@ HF_INDEX = {
     "embedding_output": 2,
     "layer0_positions": 3,
     "layer0_attn_input_raw": 4,
-    # HF 这轮没有单独 dump 该点，使用 input_after_prepare 对齐
     "layer0_attn_after_input_layernorm_only": 5,
     "layer0_attn_input_after_prepare": 5,
     "attn_input_last_layer": 6,
     "q_pre_norm": 7,
     "k_pre_norm": 8,
     "v_pre_norm": 9,
-    # HF 这轮未产出这 4 个点，设为 -1 自动跳过
     "q_post_norm": -1,
     "k_post_norm": -1,
     "q_post_rope": -1,
@@ -38,21 +37,20 @@ SG_INDEX = {
     "embedding_output": 2,
     "layer0_attn_input_raw": 3,
     "layer0_positions": 4,
-    # 5~8 是 rmsnorm_stage_*，主流程对应点从 9 开始
-    "layer0_attn_after_input_layernorm_only": 9,
-    "layer0_attn_input_after_prepare": 10,
-    "attn_input_last_layer": 11,
-    "q_pre_norm": 12,
-    "k_pre_norm": 13,
-    "v_pre_norm": 14,
-    "q_post_norm": 15,
-    "k_post_norm": 16,
-    "q_post_rope": 17,
-    "k_post_rope": 18,
-    "attn_context_before_o_proj": 19,
-    "attn_out_last_layer": 20,
-    "final_hidden_before_lm_head": 21,
-    "lm_head_weight": 22,
+    "layer0_attn_after_input_layernorm_only": 5,
+    "layer0_attn_input_after_prepare": 6,
+    "attn_input_last_layer": 7,
+    "q_pre_norm": 8,
+    "k_pre_norm": 9,
+    "v_pre_norm": 10,
+    "q_post_norm": 11,
+    "k_post_norm": 12,
+    "q_post_rope": 13,
+    "k_post_rope": 14,
+    "attn_context_before_o_proj": 15,
+    "attn_out_last_layer": 16,
+    "final_hidden_before_lm_head": 17,
+    "lm_head_weight": 18,
 }
 
 # 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名
