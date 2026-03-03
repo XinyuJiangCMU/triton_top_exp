@@ -2,7 +2,7 @@
 from pathlib import Path
 
 import torch
-
+# prepare_attn -- deterministic done.
 # ====== 按你当前这轮实验日志更新 ======
 # HF dump (day0 脚本侧): partial_name=1772495566.2086942
 # SG dump (server 侧):   partial_name=1772495553.4705586
