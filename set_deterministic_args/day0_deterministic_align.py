@@ -623,15 +623,16 @@ def hf_get_logprobs(
                     qn, kn = q, k
                     if hasattr(_module, "q_norm") and hasattr(_module, "k_norm"):
                         try:
-                            # Align with SGLang apply_qk_norm: reshape by head_dim only.
+                            # Align with local HF / verify: norm on float32 input -> float32 output,
+                            # so HF_dump matches norm(float32(pre_norm)) instead of float32(norm(bf16)).
                             head_dim = getattr(_module, "head_dim", None)
                             if head_dim is None and hasattr(_module, "q_norm") and hasattr(_module.q_norm, "weight"):
                                 head_dim = int(_module.q_norm.weight.numel())
                             if head_dim is not None and head_dim > 0:
-                                qn = _module.q_norm(q.reshape(-1, head_dim)).view_as(q)
-                                kn = _module.k_norm(k.reshape(-1, head_dim)).view_as(k)
-                                qn = qn.float()
-                                kn = kn.float()
+                                q_fp = q.float()
+                                k_fp = k.float()
+                                qn = _module.q_norm(q_fp.reshape(-1, head_dim)).view_as(q_fp)
+                                kn = _module.k_norm(k_fp.reshape(-1, head_dim)).view_as(k_fp)
                                 _maybe_dump("layer0_q_post_norm", _hf_slice(qn))
                                 _maybe_dump("layer0_k_post_norm", _hf_slice(kn))
                             else:
@@ -773,10 +774,11 @@ def hf_get_logprobs(
                             if num_heads is not None and num_kv_heads is not None:
                                 q_head_dim = q.shape[-1] // num_heads
                                 k_head_dim = k.shape[-1] // num_kv_heads
-                                qn = _module.q_norm(q.view(q.shape[0], q.shape[1], num_heads, q_head_dim)).reshape_as(q)
-                                kn = _module.k_norm(k.view(k.shape[0], k.shape[1], num_kv_heads, k_head_dim)).reshape_as(k)
-                                qn = qn.float()
-                                kn = kn.float()
+                                # Norm on float32 input -> float32 output, so HF_dump matches local HF.
+                                q_fp = q.float()
+                                k_fp = k.float()
+                                qn = _module.q_norm(q_fp.view(q_fp.shape[0], q_fp.shape[1], num_heads, q_head_dim)).reshape_as(q_fp)
+                                kn = _module.k_norm(k_fp.view(k_fp.shape[0], k_fp.shape[1], num_kv_heads, k_head_dim)).reshape_as(k_fp)
                                 _maybe_dump("q_post_norm", _hf_slice(qn))
                                 _maybe_dump("k_post_norm", _hf_slice(kn))
 
