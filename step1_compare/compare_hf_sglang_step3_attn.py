@@ -4,10 +4,10 @@ import re
 
 import torch
 # ====== 按你当前这轮实验日志更新 ======
-# HF dump (day0 脚本侧): partial_name=1772517893.9605722
-# SG dump (server 侧):   partial_name=1772517881.2454364
-HF_DIR = Path("/tmp/dumper/sglang_dump_1772517893.9605722")
-SG_DIR = Path("/tmp/dumper/sglang_dump_1772517881.2454364")
+# HF dump (day0 脚本侧): partial_name=1772572455.926678
+# SG dump (server 侧):   partial_name=1772572442.1473558
+HF_DIR = Path("/tmp/dumper/sglang_dump_1772572455.926678")
+SG_DIR = Path("/tmp/dumper/sglang_dump_1772572442.1473558")
 
 # ====== 按你的当前实验修改这些 index 映射 ======
 HF_INDEX = {
@@ -16,11 +16,11 @@ HF_INDEX = {
     "embedding_output": -1,
     "layer0_positions": 1,
     "layer0_attn_input_raw": 2,
-    # 本轮 HF 未单独 dump 该点，避免语义误对齐，直接 skip
+    # 本轮 HF 未单独 dump 该点，直接 skip
     "layer0_attn_after_input_layernorm_only": -1,
     "layer0_attn_input_after_prepare": 3,
-    "layer0_hidden_component_after_postprocess": 12,
-    "layer0_decoder_output_full": 13,
+    "layer0_hidden_component_after_postprocess": 16,
+    "layer0_decoder_output_full": 17,
     "layer8_attn_input_after_prepare": -1,
     "layer8_hidden_component_after_postprocess": -1,
     "layer8_decoder_output_full": -1,
@@ -33,32 +33,32 @@ HF_INDEX = {
     "layer32_attn_input_after_prepare": -1,
     "layer32_hidden_component_after_postprocess": -1,
     "layer32_decoder_output_full": -1,
-    "attn_input_last_layer": 14,
-    "q_pre_norm": 15,
-    "k_pre_norm": 16,
-    "v_pre_norm": 17,
-    # 本轮 HF 未产出这 4 个点，设为 -1 自动跳过
+    "attn_input_last_layer": 18,
+    "q_pre_norm": 19,
+    "k_pre_norm": 20,
+    "v_pre_norm": 21,
+    # 本轮 HF 仍未产出这 4 个 last-layer post 点
     "q_post_norm": -1,
     "k_post_norm": -1,
     "q_post_rope": -1,
     "k_post_rope": -1,
-    "attn_context_before_o_proj": 18,
-    "attn_out_last_layer": 19,
-    "final_hidden_before_lm_head": 20,
-    "lm_head_weight": 21,
-    # 新增 layer0 细粒度点（后续可直接打开 compare）
+    "attn_context_before_o_proj": 22,
+    "attn_out_last_layer": 23,
+    "final_hidden_before_lm_head": 24,
+    "lm_head_weight": 25,
+    # layer0 细粒度点
     "layer0_attn_context_before_o_proj": 4,
     "layer0_attn_out_after_o_proj": 5,
     "layer0_q_pre_norm": 6,
     "layer0_k_pre_norm": 7,
     "layer0_v_pre_norm": 8,
-    "layer0_q_post_norm": -1,
-    "layer0_k_post_norm": -1,
-    "layer0_q_post_rope": -1,
-    "layer0_k_post_rope": -1,
-    "layer0_after_attn_residual_add": 9,
-    "layer0_post_attention_layernorm_output": 10,
-    "layer0_mlp_output": 11,
+    "layer0_q_post_norm": 9,
+    "layer0_k_post_norm": 10,
+    "layer0_q_post_rope": 11,
+    "layer0_k_post_rope": 12,
+    "layer0_after_attn_residual_add": 13,
+    "layer0_post_attention_layernorm_output": 14,
+    "layer0_mlp_output": 15,
 }
 
 SG_INDEX = {
@@ -67,8 +67,7 @@ SG_INDEX = {
     "layer0_attn_input_raw": 3,
     "layer0_positions": 4,
     "layer0_attn_after_input_layernorm_only": 5,
-    "layer0_attn_input_after_prepare": 6,
-    # SG 里 layer0_attn_input_after_prepare 有重复 index（6/7），取第一处
+    "layer0_attn_input_after_prepare": 6,  # 6/7 都是该点，取第一处
     "layer0_hidden_component_after_postprocess": 20,
     "layer0_decoder_output_full": 21,
     "layer8_attn_input_after_prepare": -1,
@@ -95,7 +94,7 @@ SG_INDEX = {
     "attn_out_last_layer": 31,
     "final_hidden_before_lm_head": 32,
     "lm_head_weight": 33,
-    # 新增 layer0 细粒度点（后续可直接打开 compare）
+    # layer0 细粒度点
     "layer0_q_pre_norm": 8,
     "layer0_k_pre_norm": 9,
     "layer0_v_pre_norm": 10,
@@ -112,9 +111,7 @@ SG_INDEX = {
 
 # 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名
 # 这里把 HF 的 layer0_attn_after_input_layernorm_only 映射到其现有命名。
-HF_NAME_OVERRIDE = {
-    "layer0_attn_after_input_layernorm_only": "layer0_attn_input_after_prepare",
-}
+HF_NAME_OVERRIDE = {}
 
 # True: 将 hidden/attention 类张量统一对齐到“单步语义”
 # - [B, T, D] -> [B, D]（取最后一步）

@@ -325,22 +325,46 @@ def hf_get_logprobs(
 
     from transformers import AttentionInterface, AutoModelForCausalLM
 
+    effective_attn_implementation = attn_implementation
+    miles_triton_patcher = None
     if attn_implementation == "triton":
-        attention_dir = Path(__file__).resolve().parent.parent / "attention_test"
-        if str(attention_dir) not in sys.path:
-            sys.path.insert(0, str(attention_dir))
-        from hf_triton_attention import triton_attention_forward
+        # Strong mode: only miles SGLang bridge patch is allowed.
+        try:
+            repo_root = Path(__file__).resolve().parents[2]
+            # Import bridge package directly from fsdp_utils to avoid
+            # triggering miles.backends.fsdp_utils.__init__ (which imports ray).
+            fsdp_utils_root = (
+                repo_root / "miles" / "miles" / "backends" / "fsdp_utils"
+            )
+            if str(fsdp_utils_root) not in sys.path:
+                sys.path.insert(0, str(fsdp_utils_root))
+            from sglang_attn_bridge.hf_sglang_triton_patch import (
+                apply_sglang_triton_attention_patch,
+            )
 
-        AttentionInterface.register("triton", triton_attention_forward)
+            miles_triton_patcher = apply_sglang_triton_attention_patch
+            effective_attn_implementation = "eager"
+            print("[HF_DEBUG] day0 uses miles SGLang Triton bridge patch.")
+        except Exception as miles_patch_e:
+            raise RuntimeError(
+                "attn_implementation=triton requires miles SGLang bridge patch, "
+                f"but import/apply failed: {miles_patch_e!r}"
+            ) from miles_patch_e
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=resolve_torch_dtype(dtype),
         device_map="auto" if device == "cuda" else device,
         trust_remote_code=True,
-        attn_implementation=attn_implementation,
+        attn_implementation=effective_attn_implementation,
     )
     model.eval()
+    if miles_triton_patcher is not None:
+        try:
+            patched_layers = miles_triton_patcher(model)
+            print(f"[HF_DEBUG] miles bridge patched layers: {patched_layers}")
+        except Exception as patch_e:
+            print(f"[HF_DEBUG] miles bridge patch failed: {patch_e!r}")
     ids = torch.tensor([token_ids], dtype=torch.long, device=model.device)
     # _maybe_dump("input_ids_for_compare", ids)
     input_embeds = None
@@ -368,6 +392,13 @@ def hf_get_logprobs(
     # 2) Cast hidden_states to BF16 right before self_attn.
     self_attn_to_layer_id: dict[int, int] = {}
     o_proj_to_layer_id: dict[int, int] = {}
+    last_layer_id = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        try:
+            last_layer_id = len(model.model.layers) - 1
+        except Exception:
+            last_layer_id = None
+
     def _norm_pre_fp32(_module, args, kwargs):
         if len(args) > 0 and isinstance(args[0], torch.Tensor):
             new_args = (args[0].float(),) + tuple(args[1:])
@@ -424,6 +455,8 @@ def hf_get_logprobs(
             layer_id = o_proj_to_layer_id.get(id(_module))
             if layer_id == 0:
                 _maybe_dump("layer0_attn_context_before_o_proj", _hf_slice(x))
+            if last_layer_id is not None and layer_id == last_layer_id:
+                _maybe_dump("attn_context_before_o_proj", _hf_slice(x))
         except Exception:
             pass
         target_dtype = _module.weight.dtype
@@ -590,26 +623,21 @@ def hf_get_logprobs(
                     qn, kn = q, k
                     if hasattr(_module, "q_norm") and hasattr(_module, "k_norm"):
                         try:
-                            num_heads = getattr(_module, "num_heads", None)
-                            num_kv_heads = getattr(_module, "num_key_value_heads", num_heads)
+                            # Align with SGLang apply_qk_norm: reshape by head_dim only.
                             head_dim = getattr(_module, "head_dim", None)
-                            if (
-                                num_heads is not None
-                                and num_kv_heads is not None
-                                and head_dim is not None
-                            ):
-                                qn = _module.q_norm(
-                                    q.view(q.shape[0], q.shape[1], num_heads, head_dim)
-                                ).reshape_as(q)
-                                kn = _module.k_norm(
-                                    k.view(q.shape[0], q.shape[1], num_kv_heads, head_dim)
-                                ).reshape_as(k)
+                            if head_dim is None and hasattr(_module, "q_norm") and hasattr(_module.q_norm, "weight"):
+                                head_dim = int(_module.q_norm.weight.numel())
+                            if head_dim is not None and head_dim > 0:
+                                qn = _module.q_norm(q.reshape(-1, head_dim)).view_as(q)
+                                kn = _module.k_norm(k.reshape(-1, head_dim)).view_as(k)
+                                qn = qn.float()
+                                kn = kn.float()
                                 _maybe_dump("layer0_q_post_norm", _hf_slice(qn))
                                 _maybe_dump("layer0_k_post_norm", _hf_slice(kn))
                             else:
                                 print(
                                     "[HF_DEBUG] skip layer0_q/k_post_norm: "
-                                    f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+                                    f"head_dim={head_dim}"
                                 )
                         except Exception as norm_e:
                             print(f"[HF_DEBUG] layer0_q/k_post_norm failed: {norm_e!r}")
@@ -620,9 +648,17 @@ def hf_get_logprobs(
                     # prefer explicit position_embeddings; fallback to module rotary_emb + position_ids.
                     rope_done = False
                     try:
-                        num_heads = getattr(_module, "num_heads", None)
-                        num_kv_heads = getattr(_module, "num_key_value_heads", num_heads)
                         head_dim = getattr(_module, "head_dim", None)
+                        if head_dim is None and hasattr(_module, "q_norm") and hasattr(_module.q_norm, "weight"):
+                            head_dim = int(_module.q_norm.weight.numel())
+                        num_heads = getattr(_module, "num_heads", None)
+                        if num_heads is None and head_dim:
+                            num_heads = qn.shape[-1] // head_dim
+                        num_kv_heads = getattr(_module, "num_key_value_heads", None)
+                        if num_kv_heads is None:
+                            num_kv_heads = getattr(_module, "num_kv_heads", None)
+                        if num_kv_heads is None and head_dim:
+                            num_kv_heads = kn.shape[-1] // head_dim
                         if (
                             num_heads is not None
                             and num_kv_heads is not None
@@ -633,6 +669,16 @@ def hf_get_logprobs(
 
                             cos = sin = None
                             position_embeddings = kwargs.get("position_embeddings", None)
+                            if position_embeddings is None:
+                                for a in args:
+                                    if (
+                                        isinstance(a, (tuple, list))
+                                        and len(a) >= 2
+                                        and torch.is_tensor(a[0])
+                                        and torch.is_tensor(a[1])
+                                    ):
+                                        position_embeddings = a
+                                        break
                             if (
                                 isinstance(position_embeddings, (tuple, list))
                                 and len(position_embeddings) >= 2
@@ -640,6 +686,15 @@ def hf_get_logprobs(
                                 cos, sin = position_embeddings[0], position_embeddings[1]
                             else:
                                 position_ids = kwargs.get("position_ids", None)
+                                if position_ids is None:
+                                    for a in args:
+                                        if (
+                                            torch.is_tensor(a)
+                                            and a.dtype in (torch.int64, torch.int32)
+                                            and a.ndim in (1, 2)
+                                        ):
+                                            position_ids = a
+                                            break
                                 rotary_emb = getattr(_module, "rotary_emb", None)
                                 if rotary_emb is not None and position_ids is not None:
                                     try:
@@ -720,11 +775,13 @@ def hf_get_logprobs(
                                 k_head_dim = k.shape[-1] // num_kv_heads
                                 qn = _module.q_norm(q.view(q.shape[0], q.shape[1], num_heads, q_head_dim)).reshape_as(q)
                                 kn = _module.k_norm(k.view(k.shape[0], k.shape[1], num_kv_heads, k_head_dim)).reshape_as(k)
+                                qn = qn.float()
+                                kn = kn.float()
                                 _maybe_dump("q_post_norm", _hf_slice(qn))
                                 _maybe_dump("k_post_norm", _hf_slice(kn))
 
-                    if attn_out_last_layer is not None:
-                        _maybe_dump("attn_context_before_o_proj", _hf_slice(attn_out_last_layer))
+                    # Last-layer attn_context_before_o_proj is captured from o_proj pre-hook
+                    # to match SGLang's "context before o_proj" semantic.
                 except Exception:
                     pass
 

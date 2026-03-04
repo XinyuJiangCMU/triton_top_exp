@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Compare HF Qwen3RMSNorm vs SGLang RMSNorm on the same dumped input."""
+"""Compare HF Qwen3RMSNorm vs SGLang RMSNorm on the same dumped input.
+
+Usage for attention Q/K norm (same input, with/without override_orig_dtype):
+  python verify_rmsnorm_hf_sglang.py --mode qk_norm --dump-dir /path/to/dumper/sglang_dump_XXX \\
+    --model-path Qwen/Qwen3-8B --norm-type both
+
+  Use HF dump dir so input (layer0_q_pre_norm / layer0_k_pre_norm) matches training side.
+  Compares: HF vs SGLang (WITH override_orig_dtype=float32) and HF vs SGLang (WITHOUT override).
+  If WITH override gives smaller max_abs, norm output dtype was the main gap; else check formula/order.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +48,29 @@ SG_INDEX_PRESET_STEP3_ATTN = {
     "attn_out_last_layer": 20,
     "final_hidden_before_lm_head": 21,
     "lm_head_weight": 22,
+    # Attention Q/K norm (layer0); index varies by run, use None + auto to resolve
+    "layer0_q_pre_norm": None,
+    "layer0_k_pre_norm": None,
+    "layer0_q_post_norm": None,
+    "layer0_k_post_norm": None,
+}
+
+# For qk_norm mode: input/output names and weight keys per norm type
+QK_NORM_CONFIG = {
+    "q": {
+        "input_name": "layer0_q_pre_norm",
+        "output_name": "layer0_q_post_norm",
+        "weight_key": "model.layers.0.self_attn.q_norm.weight",
+        "expected_input_last_dim": 4096,
+        "head_dim": 128,
+    },
+    "k": {
+        "input_name": "layer0_k_pre_norm",
+        "output_name": "layer0_k_post_norm",
+        "weight_key": "model.layers.0.self_attn.k_norm.weight",
+        "expected_input_last_dim": 1024,
+        "head_dim": 128,
+    },
 }
 
 DEFAULT_OUTPUT_NAME_CANDIDATES = [
@@ -154,6 +186,23 @@ def parse_args() -> argparse.Namespace:
             "Enable SGLang batch_invariant_ops in this process so both local HF and "
             "local SGLang RMSNorm use the same aten::mean override path."
         ),
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="input_layernorm",
+        choices=["input_layernorm", "qk_norm"],
+        help=(
+            "input_layernorm: compare decoder input_layernorm (default). "
+            "qk_norm: compare attention q_norm/k_norm on layer0_q_pre_norm / layer0_k_pre_norm dump."
+        ),
+    )
+    parser.add_argument(
+        "--norm-type",
+        type=str,
+        default="both",
+        choices=["q", "k", "both"],
+        help="For --mode qk_norm: which norm to run (q, k, or both).",
     )
     return parser.parse_args()
 
@@ -349,8 +398,126 @@ def load_weight_from_model(model_path: str, weight_key: str) -> torch.Tensor:
     )
 
 
+def _run_qk_norm_mode(args: argparse.Namespace) -> None:
+    """Compare HF vs SGLang (with/without override_orig_dtype) on layer0 q_norm/k_norm using dump input."""
+    os.environ["SGLANG_USE_AITER"] = "0"
+    sglang_python = Path(__file__).resolve().parents[2] / "sglang" / "python"
+    if str(sglang_python) not in sys.path:
+        sys.path.insert(0, str(sglang_python))
+    if "/app/sglang/python" not in sys.path:
+        sys.path.insert(0, "/app/sglang/python")
+
+    from sglang.srt.layers.layernorm import RMSNorm as SgRMSNorm
+    from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_global_server_args_for_scheduler(
+        SimpleNamespace(rl_on_policy_target="fsdp" if device.type == "cuda" else None)
+    )
+
+    norm_types = ["q", "k"] if args.norm_type == "both" else [args.norm_type]
+    for ntype in norm_types:
+        cfg = QK_NORM_CONFIG[ntype]
+        input_name = cfg["input_name"]
+        output_name = cfg["output_name"]
+        weight_key = cfg["weight_key"]
+        head_dim = cfg["head_dim"]
+        expected_last = cfg["expected_input_last_dim"]
+
+        in_path = resolve_unique_dump_file(
+            args.dump_dir,
+            input_name,
+            None,
+            auto_index_policy=args.auto_index_policy,
+            fallback_to_auto_on_missing_index=args.fallback_to_auto_on_missing_index,
+        )
+        x_raw = load_dump_tensor(in_path)
+        if x_raw.shape[-1] != expected_last:
+            print(f"[{ntype}_norm] skip: input last dim {x_raw.shape[-1]} != {expected_last}")
+            continue
+        x_flat = x_raw.reshape(-1, head_dim).contiguous()
+        x_fp32 = x_flat.to(device=device, dtype=torch.float32)
+        x_bf16 = x_flat.to(device=device, dtype=torch.bfloat16)
+
+        weight = load_weight_from_model(args.model_path, weight_key).contiguous().to(device)
+        if weight.shape != (head_dim,):
+            print(f"[{ntype}_norm] skip: weight shape {tuple(weight.shape)} != ({head_dim},)")
+            continue
+
+        # HF norm (always float32 in -> float32 out)
+        hf_norm = HfQwen3RMSNorm(hidden_size=head_dim, eps=args.eps).to(device)
+        hf_norm.weight.data.copy_(weight.to(dtype=hf_norm.weight.dtype))
+        y_hf = hf_norm(x_fp32.clone())
+
+        # SGLang WITH override_orig_dtype=float32 (match HF output dtype)
+        sg_with = SgRMSNorm(
+            hidden_size=head_dim,
+            eps=args.eps,
+            weight_dtype=torch.float32,
+            cast_x_before_out_mul=True,
+            override_orig_dtype=torch.float32,
+        ).to(device)
+        sg_with.weight.data.copy_(weight.to(dtype=sg_with.weight.dtype))
+        y_sg_override = sg_with.forward_native(x_fp32.clone())
+        if isinstance(y_sg_override, tuple):
+            y_sg_override = y_sg_override[0]
+
+        # SGLang WITHOUT override (output = input dtype, so bf16 when input bf16)
+        sg_without = SgRMSNorm(
+            hidden_size=head_dim,
+            eps=args.eps,
+            weight_dtype=torch.float32,
+            cast_x_before_out_mul=True,
+        ).to(device)
+        sg_without.weight.data.copy_(weight.to(dtype=sg_without.weight.dtype))
+        y_sg_no_override = sg_without.forward_native(x_bf16.clone())
+        if isinstance(y_sg_no_override, tuple):
+            y_sg_no_override = y_sg_no_override[0]
+
+        print(f"\n{'='*60}")
+        print(f"QK norm: {ntype.upper()} (input from {in_path.name})")
+        print(f"{'='*60}")
+        compare_pair(
+            f"HF vs SGLang (WITH override_orig_dtype=float32)",
+            y_hf.cpu().float(),
+            y_sg_override.cpu().float(),
+        )
+        compare_pair(
+            f"HF vs SGLang (WITHOUT override, SG output bf16)",
+            y_hf.cpu().float(),
+            y_sg_no_override.cpu().float(),
+        )
+        # Optional: compare to dumped output if present
+        try:
+            out_path = resolve_unique_dump_file(
+                args.dump_dir,
+                output_name,
+                None,
+                auto_index_policy=args.auto_index_policy,
+                fallback_to_auto_on_missing_index=args.fallback_to_auto_on_missing_index,
+            )
+            y_dump = load_dump_tensor(out_path).to(device)
+            y_dump_flat = y_dump.reshape(-1, head_dim)
+            compare_pair(
+                f"HF vs dump ({output_name})",
+                y_hf.cpu().float(),
+                y_dump_flat.cpu().float(),
+            )
+        except Exception as e:
+            print(f"[{output_name}] dump not used: {e}")
+
+    print("\n[Conclusion] Compare the two 'HF vs SGLang' blocks above. "
+          "If 'WITH override' has smaller max_abs than 'WITHOUT override', then output dtype was the main gap. "
+          "If WITH override is larger, HF and SGLang norm implementation (variance/rsqrt/weight order) likely differ.")
+    return
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.mode == "qk_norm":
+        _run_qk_norm_mode(args)
+        return
 
     os.environ["SGLANG_USE_AITER"] = "0"
     if "/app/sglang/python" not in sys.path:
