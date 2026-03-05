@@ -242,6 +242,59 @@ def compare_attn_intermediate(name: str, sg_entries, tr_entries) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sanity check: sample alignment vs weight bit-level difference
+# ---------------------------------------------------------------------------
+
+SANITY_PRINT_TOKENS = 3   # how many tokens to print
+SANITY_PRINT_DIMS  = 8    # how many feature dims to print per token
+
+def sanity_check_sample_alignment(name: str, sg_entries, tr_entries) -> None:
+    """
+    Print the raw values of the first few tokens (and dims) for both sides.
+
+    Interpretation guide
+    --------------------
+    - Values completely different  →  different samples are being compared
+                                      (alignment bug in Strategy B pairing)
+    - Values close but not bit-exact → same sample, tiny weight / precision diff
+    - Values bit-exact               → perfect match before any accumulation
+    """
+    # Find first SG prefill (shape[0] > 1)
+    sg_prefill = None
+    for idx, p in sg_entries:
+        t = load_pt(p)
+        if t.ndim >= 2 and t.shape[0] > 1:
+            sg_prefill = (idx, p, t)
+            break
+
+    if sg_prefill is None:
+        print(f"[sanity/{name}] SKIP: no prefill found in SG")
+        return
+
+    sg_idx, _sg_path, sg_t = sg_prefill
+    tr_idx, _tr_path = tr_entries[0]
+    tr_t = load_pt(_tr_path)
+
+    N = min(SANITY_PRINT_TOKENS, sg_t.shape[0], tr_t.shape[0])
+    D = min(SANITY_PRINT_DIMS, sg_t.shape[-1], tr_t.shape[-1])
+
+    print()
+    print(f"[sanity/{name}]  SG idx={sg_idx} shape={tuple(sg_t.shape)}  TR idx={tr_idx} shape={tuple(tr_t.shape)}")
+    print(f"  Printing first {N} tokens × first {D} dims  (to diagnose: sample mismatch vs weight diff)")
+    for tok in range(N):
+        sg_vals = sg_t[tok, :D].float().tolist()
+        tr_vals = tr_t[tok, :D].float().tolist()
+        sg_str = "  ".join(f"{v:+.4f}" for v in sg_vals)
+        tr_str = "  ".join(f"{v:+.4f}" for v in tr_vals)
+        diff   = [(a - b) for a, b in zip(tr_t[tok, :D].float().tolist(), sg_vals)]
+        diff_str = "  ".join(f"{v:+.4f}" for v in diff)
+        print(f"  tok[{tok}]  SG= {sg_str}")
+        print(f"  tok[{tok}]  TR= {tr_str}")
+        print(f"  tok[{tok}]  Δ = {diff_str}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -275,6 +328,13 @@ def main() -> None:
     print("Strategy B: attention intermediates, full-prefix comparison")
     print("  (TR[:P] vs SG_prefill[:P], P = min(prefill_len, seq_len))")
     print("=" * 60)
+
+    # Sanity check: print actual values of first few tokens for layer0_q_pre_norm
+    # to determine whether sample mismatch or weight bit-level difference
+    sanity_name = "layer0_q_pre_norm"
+    if sanity_name in sg and sanity_name in tr:
+        sanity_check_sample_alignment(sanity_name, sg[sanity_name], tr[sanity_name])
+
     for name in sorted(ATTN_INTERMEDIATE_NAMES & set(common)):
         compare_attn_intermediate(name, sg[name], tr[name])
 
