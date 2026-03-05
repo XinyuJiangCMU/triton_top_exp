@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/data/yuzhen2/true_on_policy/experiment/step1_compare/results/day0_runs"),
+        default=Path("/data/true_on_policy/experiment/step1_compare/results/day0_runs"),
     )
     parser.add_argument("--server-start-timeout", type=int, default=180)
     parser.add_argument("--server-stop-timeout", type=int, default=20)
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compare-script",
         type=Path,
-        default=Path("/data/yuzhen2/true_on_policy/experiment/step1_compare/compare_hf_sglang_step3_attn.py"),
+        default=Path("/data/true_on_policy/experiment/step1_compare/compare_hf_sglang_step3_attn.py"),
     )
     return parser.parse_args()
 
@@ -99,7 +99,7 @@ def ensure_dir(path: Path) -> None:
 
 
 def build_pythonpath() -> str:
-    base = "/app/sglang/python:/data/yuzhen2/true_on_policy/miles:/data/yuzhen2/true_on_policy"
+    base = "/app/sglang/python:/data/true_on_policy/miles:/data/true_on_policy"
     current = os.environ.get("PYTHONPATH", "")
     return f"{base}:{current}" if current else base
 
@@ -358,7 +358,7 @@ def build_server_cmd(args: argparse.Namespace) -> list[str]:
 def build_day0_cmd(args: argparse.Namespace) -> list[str]:
     cmd = [
         sys.executable,
-        "/data/yuzhen2/true_on_policy/experiment/set_deterministic_args/day0_deterministic_align.py",
+        "/data/true_on_policy/experiment/set_deterministic_args/day0_deterministic_align.py",
         "--host",
         args.host,
         "--port",
