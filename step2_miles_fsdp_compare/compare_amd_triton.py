@@ -17,8 +17,7 @@ Strategy B — attention intermediate tensors
 
 Usage:
   Update SG_DIR / TR_DIR below, then:
-  PYTHONPATH=/data/true_on_policy/sglang/python \
-  python experiment/step2_miles_fsdp_compare/compare_amd_triton.py
+  python /app/true_on_policy/amd-top-test/step2_miles_fsdp_compare/compare_amd_triton.py
 """
 from pathlib import Path
 import re
@@ -27,8 +26,9 @@ import collections
 import torch
 
 # ===== Update these per run =====
-SG_DIR = Path("/tmp/my_dumps/sglang_dump_1772735058.4545045")   # SGLang inference
-TR_DIR = Path("/tmp/my_dumps/sglang_dump_1772735080.550444")   # FSDP training
+RUN_DIR = Path("/app/true_on_policy/results/miles_fsdp_debug_v2")
+SG_DIR = RUN_DIR / "dumps" / "sglang_dump_1772746622.1748765"   # SGLang inference
+TR_DIR = RUN_DIR / "dumps" / "sglang_dump_1772746644.48004"     # FSDP training
 
 DIFF_THRESHOLD = 1e-3
 
