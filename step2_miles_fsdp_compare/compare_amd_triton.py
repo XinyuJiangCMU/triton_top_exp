@@ -72,6 +72,7 @@ DISPLAY_GROUPS = [
     (
         "== Layer0 / Block ==",
         [
+            "layer0_mlp_input",
             "layer0_block_out_before_residual_add",
             "layer0_block_out_after_residual_add",
             "layer0_block_out",
