@@ -17,11 +17,10 @@ from pathlib import Path
 import torch
 
 # ─── Config ───
-RUN_DIR = Path(os.environ.get(
-    "COMPARE_RUN_DIR",
-    "/app/true_on_policy/results/miles_fsdp_debug_v2",
+DUMPS_DIR = Path(os.environ.get(
+    "COMPARE_DUMPS_DIR",
+    "/app/true_on_policy/results/amd_triton_dumps",
 ))
-DUMPS_DIR = RUN_DIR / "dumps"
 
 PAT = re.compile(
     r"forward_pass_id=(\d+)___rank=(\d+)___name=(.*?)___dump_index=(\d+)\.pt$"
@@ -118,13 +117,13 @@ def find_pair():
 
 def find_first_prefill_idx(sg: dict) -> int:
     """Find dump_index of SG's first prefill (shape[0] > 1)."""
-    probe_name = "layer0_q_pre_norm"
-    if probe_name not in sg:
-        return None
-    for idx, p in sg[probe_name]:
-        t = load(p)
-        if t.ndim >= 2 and t.shape[0] > 1:
-            return idx
+    for probe_name in ["layer0_q_pre_norm", "layer0_q_post_rope", "layer0_v_pre_norm"]:
+        if probe_name not in sg:
+            continue
+        for idx, p in sg[probe_name]:
+            t = load(p)
+            if t.ndim >= 2 and t.shape[0] > 1:
+                return idx
     return None
 
 
@@ -193,17 +192,21 @@ def main():
         eq = torch.equal(sg_t, tr_t)
         tag = "✅" if eq else "❌"
 
+        def short_dtype(t):
+            return str(t.dtype).replace("torch.", "")
+
+        dtypes = f"  [{short_dtype(sg_t)} vs {short_dtype(tr_t)}]"
+
         if eq:
-            print(f"{tag} {display}")
+            print(f"{tag} {display}{dtypes}")
+        elif name == "next_token_id":
+            print(f"{tag} {display}  SG={sg_t.tolist()}  TR={tr_t.tolist()}{dtypes}")
+        elif sg_t.is_floating_point():
+            d = (sg_t.float() - tr_t.float()).abs()
+            print(f"{tag} {display}  max={d.max().item():.3e}  mean={d.mean().item():.3e}{dtypes}")
         else:
-            if name == "next_token_id":
-                print(f"{tag} {display}  SG={sg_t.tolist()}  TR={tr_t.tolist()}")
-            elif sg_t.is_floating_point():
-                d = (sg_t - tr_t).abs()
-                print(f"{tag} {display}  max_diff={d.max().item():.3e}  mean_diff={d.mean().item():.3e}")
-            else:
-                neq = int((sg_t != tr_t).sum())
-                print(f"{tag} {display}  mismatched={neq}/{sg_t.numel()}")
+            neq = int((sg_t != tr_t).sum())
+            print(f"{tag} {display}  mismatched={neq}/{sg_t.numel()}{dtypes}")
 
 
 if __name__ == "__main__":
