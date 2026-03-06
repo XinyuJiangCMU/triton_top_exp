@@ -36,29 +36,8 @@ SKIP_NAMES = {
     "final_hidden_before_lm_head", # SG-only
 }
 
-# Readable display names
-DISPLAY_NAMES = {
-    "next_token_id":                        "token_id",
-    "next_token_logprob_selected":          "logprob (selected token)",
-    "layer0_q_pre_norm":                    "L0  q  (after proj, before norm)",
-    "layer0_k_pre_norm":                    "L0  k  (after proj, before norm)",
-    "layer0_v_pre_norm":                    "L0  v  (after proj)",
-    "layer0_q_post_norm":                   "L0  q  (after norm)",
-    "layer0_k_post_norm":                   "L0  k  (after norm)",
-    "layer0_q_post_rope":                   "L0  q  (after rope)",
-    "layer0_k_post_rope":                   "L0  k  (after rope)",
-    "layer0_attn_context_before_o_proj":    "L0  attn_out (before o_proj)",
-    "layer0_attn_out_after_o_proj":         "L0  attn_out (after o_proj)",
-    "q_pre_norm":                           "L-1 q  (after proj, before norm)",
-    "k_pre_norm":                           "L-1 k  (after proj, before norm)",
-    "v_pre_norm":                           "L-1 v  (after proj)",
-    "q_post_norm":                          "L-1 q  (after norm)",
-    "k_post_norm":                          "L-1 k  (after norm)",
-    "q_post_rope":                          "L-1 q  (after rope)",
-    "k_post_rope":                          "L-1 k  (after rope)",
-    "attn_context_before_o_proj":           "L-1 attn_out (before o_proj)",
-    "attn_out_last_layer":                  "L-1 attn_out (after o_proj)",
-}
+# Display raw tensor names directly (e.g. layer0_q_pre_norm).
+DISPLAY_NAMES = {}
 
 # Order for display (layer0 first, then last layer, then logits)
 DISPLAY_ORDER = [
