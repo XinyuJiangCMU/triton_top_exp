@@ -7,3 +7,4 @@ attention_test/results
 step1_compare/__pycache__
 step2_miles_fsdp_compare/*.log
 step2_miles_fsdp_compare/results
+step2_miles_fsdp_compare/__pycache__

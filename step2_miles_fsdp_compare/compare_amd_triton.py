@@ -127,6 +127,21 @@ def find_first_prefill_idx(sg: dict) -> int:
     return None
 
 
+
+
+def _align_non_logit_shapes(sg_t: torch.Tensor, tr_t: torch.Tensor):
+    """Best-effort shape alignment for compare without changing semantics."""
+    if sg_t.shape == tr_t.shape:
+        return sg_t, tr_t
+
+    # Common case: one side is transposed [feat, seq] vs [seq, feat]
+    if sg_t.ndim == 2 and tr_t.ndim == 2 and sg_t.shape == tr_t.T.shape:
+        return sg_t, tr_t.T
+
+    # Fallback for non-comparable shapes: return as-is, caller will report/skip
+    return sg_t, tr_t
+
+
 def get_sg_entry(entries: list, prefill_idx: int, is_logit: bool) -> tuple:
     """Pick the right SG entry.
     - For logits: first entry with dump_index >= prefill_idx (from the prefill pass)
@@ -187,6 +202,12 @@ def main():
             P = min(sg_t.shape[0], tr_t.shape[0])
             sg_t = sg_t[:P]
             tr_t = tr_t[:P]
+            sg_t, tr_t = _align_non_logit_shapes(sg_t, tr_t)
+
+        if sg_t.shape != tr_t.shape:
+            print(f"❌ {display}  shape_mismatch SG={tuple(sg_t.shape)} TR={tuple(tr_t.shape)}  "
+                  f"[{str(sg_t.dtype).replace('torch.', '')} vs {str(tr_t.dtype).replace('torch.', '')}]")
+            continue
 
         # Compare
         eq = torch.equal(sg_t, tr_t)
