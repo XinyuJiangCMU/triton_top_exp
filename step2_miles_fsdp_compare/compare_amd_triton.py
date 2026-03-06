@@ -1,430 +1,321 @@
 #!/usr/bin/env python3
 """
-Compare FSDP training-side dumps vs SGLang inference-side dumps
-for AMD Triton true-on-policy verification.
+Compare SG (SGLang inference) vs TR (FSDP training) dumps for
+true-on-policy verification.
 
-Two comparison strategies:
+Designed for --rollout-max-response-len 1 (single token per response).
 
-Strategy A — logprob / logit tensors
-  Sequential alignment: training pass[k] token[t]  ←→  inference decode step k*N_resp+t
-  Cross-validated by printing matching next_token_id pairs.
-  NOTE: most reliable when run with --rollout-max-response-len 1 (N_resp=1 → 1-to-1 mapping).
+How it works
+============
+SG side (inference):
+  - Prefill: processes prompt tokens → intermediates shape (P, dim)
+  - Produces logits at last position → predicts the 1 response token
+  - May also have decode steps (shape 1) and re-computation passes
 
-Strategy B — attention intermediate tensors
-  Full-prefix comparison: TR[:P] vs SG_prefill[:P], P = min(prefill_len, training_seq_len).
-  The prefill pass and the teacher-forcing pass process the same prompt tokens at the
-  same positions → should be bit-wise identical under true-on-policy.
+TR side (training):
+  - Teacher-forcing on full padded sequence → intermediates shape (seq_len, dim)
+  - Produces logits for response token(s) → shape (N_resp, vocab)
+
+Comparison strategy
+===================
+1. PREFILL intermediates:  SG_prefill[:P] vs TR[:P]
+   Both sides process the same prompt tokens with the same weights,
+   so these should be identical under true-on-policy.
+
+2. LOGITS: SG's first-prefill logit vs TR's first logit (row 0)
+   The prefill's logit predicts the first response token.
+
+Dump pairing
+============
+We find the first SG PREFILL forward pass (intermediates with shape[0] > 1)
+and pair its logit with TR's first logit. This avoids the bug where the first
+prefill was not captured by the dumper and decode-step logits got incorrectly
+matched to TR teacher-forcing logits.
 
 Usage:
-  python /app/true_on_policy/amd-top-test/step2_miles_fsdp_compare/compare_amd_triton.py
+  python compare_amd_triton.py
+  COMPARE_RUN_DIR=/path/to/results python compare_amd_triton.py
 """
-from pathlib import Path
-import re
-import collections
 import os
+import re
+import sys
+import datetime
+import collections
+from pathlib import Path
 
 import torch
 
-# ===== Auto-discovery root (override with env COMPARE_RUN_DIR if needed) =====
-RUN_DIR = Path(os.environ.get("COMPARE_RUN_DIR", "/app/true_on_policy/results/miles_fsdp_debug_v2"))
+# ─── Config ───
+RUN_DIR = Path(os.environ.get(
+    "COMPARE_RUN_DIR",
+    "/app/true_on_policy/results/miles_fsdp_debug_v2",
+))
 DUMPS_DIR = RUN_DIR / "dumps"
-
 DIFF_THRESHOLD = 1e-3
 
-LOGPROB_NAMES = {
-    "next_token_logprob_selected",
-    "next_token_logits_raw",
-    "next_token_logprobs_full",
-    "next_token_id",
-}
-
-ATTN_INTERMEDIATE_NAMES = {
-    "layer0_q_pre_norm", "layer0_k_pre_norm", "layer0_v_pre_norm",
-    "layer0_q_post_norm", "layer0_k_post_norm",
-    "layer0_q_post_rope", "layer0_k_post_rope",
-    "layer0_attn_context_before_o_proj", "layer0_attn_out_after_o_proj",
-    "q_pre_norm", "k_pre_norm", "v_pre_norm",
-    "q_post_norm", "k_post_norm",
-    "q_post_rope", "k_post_rope",
-    "attn_context_before_o_proj", "attn_out_last_layer",
-}
-
-_PAT = re.compile(
+# ─── File name pattern ───
+PAT = re.compile(
     r"forward_pass_id=(\d+)___rank=(\d+)___name=(.*?)___dump_index=(\d+)\.pt$"
 )
 
-
-def _read_first_rank0_tensor_shape(dump_dir: Path, name: str):
-    pts = sorted(dump_dir.glob(f"*___rank=0___name={name}___dump_index=*.pt"))
-    if not pts:
-        return None
-    t = load_pt(pts[0])
-    return tuple(t.shape)
-
-
-def _classify_dump_dir(dump_dir: Path) -> str:
-    """
-    Heuristic role detection:
-    - SG dump usually has input_ids_for_compare and next_token_id shape (1,)
-    - TR/HF dump usually has next_token_id shape (N_resp,) where N_resp > 1
-    """
-    has_input_ids = any(dump_dir.glob("*___rank=0___name=input_ids_for_compare___dump_index=*.pt"))
-    next_id_shape = _read_first_rank0_tensor_shape(dump_dir, "next_token_id")
-
-    if has_input_ids:
-        return "SG"
-    if next_id_shape and len(next_id_shape) >= 1 and next_id_shape[0] > 1:
-        return "TR"
-    if next_id_shape and len(next_id_shape) >= 1 and next_id_shape[0] == 1:
-        return "SG"
-    return "UNKNOWN"
+LOGIT_NAMES = {
+    "next_token_id",
+    "next_token_logits_raw",
+    "next_token_logprobs_full",
+    "next_token_logprob_selected",
+}
 
 
-def resolve_latest_dump_pair():
-    dump_dirs = sorted(
+# ─── Helpers ───
+
+def load(p: Path) -> torch.Tensor:
+    x = torch.load(p, weights_only=False, map_location="cpu")
+    if isinstance(x, dict) and "value" in x:
+        x = x["value"]
+    return x
+
+
+def scan(d: Path) -> dict:
+    """Returns {name: [(dump_index, path)]} sorted by dump_index, rank=0 only."""
+    out = collections.defaultdict(list)
+    for p in d.glob("*.pt"):
+        m = PAT.match(p.name)
+        if m and int(m.group(2)) == 0:
+            out[m.group(3)].append((int(m.group(4)), p))
+    for k in out:
+        out[k].sort()
+    return out
+
+
+def find_pair():
+    """Auto-discover latest SG + TR dump pair.
+    SG dumps contain input_ids_for_compare; TR dumps do not."""
+    dirs = sorted(
         [p for p in DUMPS_DIR.glob("sglang_dump_*") if p.is_dir()],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if not dump_dirs:
-        raise RuntimeError(f"No dump dirs found under: {DUMPS_DIR}")
-
-    sg_dirs = [d for d in dump_dirs if _classify_dump_dir(d) == "SG"]
-    tr_dirs = [d for d in dump_dirs if _classify_dump_dir(d) == "TR"]
-
-    if not sg_dirs or not tr_dirs:
-        raise RuntimeError(
-            f"Could not find both SG and TR dumps under {DUMPS_DIR}. "
-            f"SG={len(sg_dirs)} TR={len(tr_dirs)}"
-        )
-
-    # Pick the most recent available pair; tie-break by smaller time gap.
-    best = None
-    for sg in sg_dirs:
-        for tr in tr_dirs:
-            pair_latest = max(sg.stat().st_mtime, tr.stat().st_mtime)
-            pair_gap = abs(sg.stat().st_mtime - tr.stat().st_mtime)
-            score = (-pair_latest, pair_gap)
-            if best is None or score < best[0]:
-                best = (score, sg, tr)
-
-    assert best is not None
-    return best[1], best[2]
+    sg = tr = None
+    for d in dirs:
+        has_input_ids = any(d.glob("*___name=input_ids_for_compare___*.pt"))
+        if has_input_ids and sg is None:
+            sg = d
+        elif not has_input_ids and tr is None:
+            tr = d
+        if sg and tr:
+            break
+    if not sg or not tr:
+        raise RuntimeError(f"Need both SG and TR dumps under {DUMPS_DIR}")
+    return sg, tr
 
 
-def scan(d: Path):
-    """Returns {name: [(dump_index, path)]} sorted by dump_index."""
-    result = collections.defaultdict(list)
-    for p in d.glob("*.pt"):
-        m = _PAT.match(p.name)
-        if not m:
-            continue
-        rank, name, idx = int(m.group(2)), m.group(3), int(m.group(4))
-        if rank != 0:
-            continue
-        result[name].append((idx, p))
-    for k in result:
-        result[k].sort(key=lambda x: x[0])
-    return result
-
-
-def load_pt(p: Path) -> torch.Tensor:
-    """Load dump file, preserve original dtype (no implicit .float())."""
-    x = torch.load(p, weights_only=False, map_location="cpu")
-    if isinstance(x, dict) and "value" in x:
-        x = x["value"]
-    assert isinstance(x, torch.Tensor), f"expected Tensor, got {type(x)}"
-    return x
-
-
-def report(label: str, a: torch.Tensor, b: torch.Tensor) -> None:
-    """
-    Print dtype, torch.equal, and abs diff.
-    Diff is computed in the NATIVE dtype — no silent upcast to float32.
-    If dtypes differ, we only report the mismatch (no diff).
-    """
-    same_dtype = a.dtype == b.dtype
-    dtype_str = f"dtype={a.dtype}" if same_dtype else f"dtype={a.dtype}≠{b.dtype}"
-
-    if same_dtype:
-        eq = torch.equal(a, b)
-        if a.is_floating_point():
-            diff = (a - b).abs()
-            max_abs = diff.max().item()
-            mean_abs = diff.mean().item()
-            ok = "✅" if max_abs <= DIFF_THRESHOLD else "❌"
-            print(
-                f"  {label}  {ok}  bitwise_equal={eq}  "
-                f"{dtype_str}  max_abs={max_abs:.3e}  mean_abs={mean_abs:.3e}"
-            )
-        else:
-            # integer / bool: report mismatch count
-            neq = int((a != b).sum().item())
-            ok = "✅" if neq == 0 else "❌"
-            print(
-                f"  {label}  {ok}  bitwise_equal={eq}  "
-                f"{dtype_str}  neq_count={neq}/{a.numel()}"
-            )
+def report(a: torch.Tensor, b: torch.Tensor, label: str = "") -> bool:
+    """Print comparison.  Returns True if within threshold."""
+    if a.dtype != b.dtype:
+        print(f"  {label}⚠️  dtype mismatch: {a.dtype} vs {b.dtype}")
+        return False
+    eq = torch.equal(a, b)
+    if a.is_floating_point():
+        d = (a - b).abs()
+        mx, mn = d.max().item(), d.mean().item()
+        ok = mx <= DIFF_THRESHOLD
+        tag = "✅" if ok else "❌"
+        print(f"  {label}{tag}  equal={eq}  max={mx:.3e}  mean={mn:.3e}  dtype={a.dtype}")
+        return ok
     else:
-        print(
-            f"  {label}  ⚠️  {dtype_str}  "
-            f"shapes={tuple(a.shape)} vs {tuple(b.shape)}  (no diff — fix dtype first)"
-        )
+        neq = int((a != b).sum())
+        ok = neq == 0
+        tag = "✅" if ok else "❌"
+        print(f"  {label}{tag}  equal={eq}  neq={neq}/{a.numel()}  dtype={a.dtype}")
+        return ok
 
 
-# ---------------------------------------------------------------------------
-# Structure dump
-# ---------------------------------------------------------------------------
+def find_first_prefill_idx(sg: dict) -> int:
+    """Find the dump_index of SG's first prefill intermediate (shape[0] > 1).
 
-def print_dump_structure(sg: dict, tr: dict) -> None:
-    common = sorted(set(sg) & set(tr))
-    print(f"\n{'Name':<45} {'SG':>4}×  shape×dtype (SG)              {'TR':>4}×  shape×dtype (TR)")
-    print("-" * 115)
-    for name in common:
-        sg_meta = sorted({(tuple(t.shape), str(t.dtype)) for _, p in sg[name] for t in [load_pt(p)]})
-        tr_meta = sorted({(tuple(t.shape), str(t.dtype)) for _, p in tr[name] for t in [load_pt(p)]})
-        sg_str = "  ".join(f"{s} {d}" for s, d in sg_meta)
-        tr_str = "  ".join(f"{s} {d}" for s, d in tr_meta)
-        print(
-            f"  {name:<43} {len(sg[name]):>4}×  {sg_str:<35}"
-            f"  {len(tr[name]):>4}×  {tr_str}"
-        )
-    print()
-
-
-# ---------------------------------------------------------------------------
-# Strategy A: logprob / logit tensors
-# ---------------------------------------------------------------------------
-
-def compare_logprob(name: str, sg_entries, tr_entries, sg_id_entries, tr_id_entries) -> None:
+    Returns the dump_index, or None if not found.
     """
-    Sequential alignment:
-      training pass[k] row[t]  ←→  inference decode step at flat index k*N_resp+t
-
-    Token-ID cross-check: prints whether next_token_id matches for each pair.
-    If IDs don't match, the alignment assumption is broken.
-    """
-    sg_decode = [(idx, p, load_pt(p)) for idx, p in sg_entries if load_pt(p).shape[0] == 1]
-    tr_passes = [(idx, p, load_pt(p)) for idx, p in tr_entries]
-
-    if not sg_decode or not tr_passes:
-        print(f"[{name}] SKIP: empty decode steps or training passes")
-        return
-
-    n_resp = tr_passes[0][2].shape[0]  # rows in first training pass = N_resp
-
-    # Load token IDs for cross-checking (may be absent)
-    sg_decode_ids = (
-        [load_pt(p).tolist() for _, p in sg_id_entries if load_pt(p).shape[0] == 1]
-        if sg_id_entries else []
-    )
-    tr_pass_ids = (
-        [load_pt(p).tolist() for _, p in tr_id_entries]
-        if tr_id_entries else []
-    )
-
-    print(f"\n[{name}]  SG decode steps={len(sg_decode)}  TR passes={len(tr_passes)}  N_resp={n_resp}")
-
-    for k, (tr_idx, _tr_path, tr_t) in enumerate(tr_passes):
-        for t in range(n_resp):
-            flat = k * n_resp + t
-            if flat >= len(sg_decode):
-                break
-            sg_idx, _sg_path, sg_t = sg_decode[flat]
-
-            # Extract the t-th element from training (keep dtype)
-            tr_elem = tr_t[t : t + 1] if tr_t.ndim == 1 else tr_t[t : t + 1]
-            sg_elem = sg_t  # shape (1, ...) or (1,)
-
-            # Squeeze trailing dim-1 if shapes differ by a leading 1
-            if tr_elem.shape != sg_elem.shape:
-                try:
-                    sg_elem = sg_elem.view_as(tr_elem)
-                except RuntimeError:
-                    pass
-
-            # Token-ID cross-check
-            id_ok = ""
-            if sg_decode_ids and tr_pass_ids and name != "next_token_id":
-                sg_id_val = sg_decode_ids[flat] if flat < len(sg_decode_ids) else "?"
-                tr_id_val = tr_pass_ids[k] if k < len(tr_pass_ids) else "?"
-                # tr_id is a list of N_resp ids; pick t-th
-                if isinstance(tr_id_val, list) and t < len(tr_id_val):
-                    tr_id_val = tr_id_val[t]
-                match = "id✅" if sg_id_val == tr_id_val else f"id❌(sg={sg_id_val} tr={tr_id_val})"
-                id_ok = f"  [{match}]"
-
-            label = f"pass[{k}] tok[{t}]  tr_idx={tr_idx} sg_idx={sg_idx}{id_ok}"
-            report(label, tr_elem, sg_elem)
-
-
-# ---------------------------------------------------------------------------
-# Strategy B: attention intermediate tensors — full prefix comparison
-# ---------------------------------------------------------------------------
-
-def compare_attn_intermediate(name: str, sg_entries, tr_entries) -> None:
-    """
-    Find the first inference PREFILL step (shape[0] > 1).
-    Compare TR[:P] vs SG_prefill[:P], P = min(prefill_len, training_seq_len).
-
-    Both sides process the same prompt tokens at the same positions, so these
-    should be bit-wise identical under true-on-policy.
-    """
-    sg_prefill = None
-    for idx, p in sg_entries:
-        t = load_pt(p)
+    probe_name = "layer0_q_pre_norm"
+    if probe_name not in sg:
+        return None
+    for idx, p in sg[probe_name]:
+        t = load(p)
         if t.ndim >= 2 and t.shape[0] > 1:
-            sg_prefill = (idx, p, t)
-            break
-
-    if sg_prefill is None:
-        print(f"[{name}] SKIP: no prefill found in inference (all decode steps have shape[0]==1)")
-        return
-
-    sg_idx, _sg_path, sg_t = sg_prefill
-    tr_idx, _tr_path = tr_entries[0]
-    tr_t = load_pt(_tr_path)
-
-    P = min(sg_t.shape[0], tr_t.shape[0])
-    sg_seg = sg_t[:P]
-    tr_seg = tr_t[:P]
-
-    print(
-        f"[{name}]  "
-        f"SG prefill idx={sg_idx} shape={tuple(sg_t.shape)} dtype={sg_t.dtype}  "
-        f"TR first-pass idx={tr_idx} shape={tuple(tr_t.shape)} dtype={tr_t.dtype}  "
-        f"comparing [:P={P}]"
-    )
-    report("prefix", tr_seg, sg_seg)
+            return idx
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Sanity check: sample alignment vs weight bit-level difference
-# ---------------------------------------------------------------------------
+def get_sg_logit_for_prefill(entries: list, prefill_idx: int) -> tuple:
+    """Get the logit entry whose dump_index is the first one >= prefill_idx.
 
-SANITY_PRINT_TOKENS = 3   # how many tokens to print
-SANITY_PRINT_DIMS  = 8    # how many feature dims to print per token
-
-def sanity_check_sample_alignment(name: str, sg_entries, tr_entries) -> None:
+    The prefill forward pass dumps intermediates first (idx ~77-100),
+    then logits right after (idx ~102-105). So the first logit entry
+    with dump_index >= prefill_idx is the correct one.
     """
-    Print the raw values of the first few tokens (and dims) for both sides.
-
-    Interpretation guide
-    --------------------
-    - Values completely different  →  different samples are being compared
-                                      (alignment bug in Strategy B pairing)
-    - Values close but not bit-exact → same sample, tiny weight / precision diff
-    - Values bit-exact               → perfect match before any accumulation
-    """
-    # Find first SG prefill (shape[0] > 1)
-    sg_prefill = None
-    for idx, p in sg_entries:
-        t = load_pt(p)
-        if t.ndim >= 2 and t.shape[0] > 1:
-            sg_prefill = (idx, p, t)
-            break
-
-    if sg_prefill is None:
-        print(f"[sanity/{name}] SKIP: no prefill found in SG")
-        return
-
-    sg_idx, _sg_path, sg_t = sg_prefill
-    tr_idx, _tr_path = tr_entries[0]
-    tr_t = load_pt(_tr_path)
-
-    N = min(SANITY_PRINT_TOKENS, sg_t.shape[0], tr_t.shape[0])
-    D = min(SANITY_PRINT_DIMS, sg_t.shape[-1], tr_t.shape[-1])
-
-    print()
-    print(f"[sanity/{name}]  SG idx={sg_idx} shape={tuple(sg_t.shape)}  TR idx={tr_idx} shape={tuple(tr_t.shape)}")
-    print(f"  Printing first {N} tokens × first {D} dims  (to diagnose: sample mismatch vs weight diff)")
-    for tok in range(N):
-        sg_vals = sg_t[tok, :D].float().tolist()
-        tr_vals = tr_t[tok, :D].float().tolist()
-        sg_str = "  ".join(f"{v:+.4f}" for v in sg_vals)
-        tr_str = "  ".join(f"{v:+.4f}" for v in tr_vals)
-        diff   = [(a - b) for a, b in zip(tr_t[tok, :D].float().tolist(), sg_vals)]
-        diff_str = "  ".join(f"{v:+.4f}" for v in diff)
-        print(f"  tok[{tok}]  SG= {sg_str}")
-        print(f"  tok[{tok}]  TR= {tr_str}")
-        print(f"  tok[{tok}]  Δ = {diff_str}")
-    print()
+    for idx, p in entries:
+        if idx >= prefill_idx:
+            return (idx, p)
+    return None
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+# ─── Main ───
 
-def main(sg_dir: Path, tr_dir: Path) -> None:
-    print(f"RUN_DIR = {RUN_DIR}")
+def main():
+    sg_dir, tr_dir = find_pair()
     print(f"SG_DIR = {sg_dir}")
     print(f"TR_DIR = {tr_dir}\n")
 
     sg = scan(sg_dir)
     tr = scan(tr_dir)
-
-    print(f"Inference unique names : {len(sg)}  (total files: {sum(len(v) for v in sg.values())})")
-    print(f"Training  unique names : {len(tr)}  (total files: {sum(len(v) for v in tr.values())})")
     common = sorted(set(sg) & set(tr))
-    print(f"Common names           : {len(common)}")
 
-    print_dump_structure(sg, tr)
+    print(f"SG names: {len(sg)}  ({sum(len(v) for v in sg.values())} files)")
+    print(f"TR names: {len(tr)}  ({sum(len(v) for v in tr.values())} files)")
+    print(f"Common  : {len(common)}")
 
-    # ---- Strategy A ----
-    print("=" * 60)
-    print("Strategy A: logprob / logit / id comparison")
-    print("  (sequential alignment; cross-checked by next_token_id)")
-    print("=" * 60)
-    sg_ids = sg.get("next_token_id", [])
-    tr_ids = tr.get("next_token_id", [])
-    for name in sorted(LOGPROB_NAMES & set(common)):
-        compare_logprob(name, sg[name], tr[name], sg_ids, tr_ids)
+    # ── Find the first prefill forward pass in SG ──
+    prefill_idx = find_first_prefill_idx(sg)
+    if prefill_idx is not None:
+        print(f"\nSG first prefill starts at dump_index={prefill_idx}")
+    else:
+        print("\n⚠️  WARNING: No prefill found in SG dump (all shape[0]==1).")
+        print("   The first prefill may not have been captured by the dumper.")
+        print("   Falling back to first entry for each name.\n")
 
-    # ---- Strategy B ----
-    print()
-    print("=" * 60)
-    print("Strategy B: attention intermediates, full-prefix comparison")
-    print("  (TR[:P] vs SG_prefill[:P], P = min(prefill_len, seq_len))")
+    # ── Dump structure table ──
+    print(f"\n{'Name':<45} {'SG':>4}  shapes" + " " * 30 + f"{'TR':>4}  shapes")
+    print("-" * 110)
+    for name in common:
+        sg_shapes = sorted({tuple(load(p).shape) for _, p in sg[name]})
+        tr_shapes = sorted({tuple(load(p).shape) for _, p in tr[name]})
+        sg_str = "  ".join(str(s) for s in sg_shapes)
+        tr_str = "  ".join(str(s) for s in tr_shapes)
+        print(f"  {name:<43} {len(sg[name]):>4}  {sg_str:<40} {len(tr[name]):>4}  {tr_str}")
+
+    # ================================================================
+    # 1. Logit / Token ID comparison
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("1. Logit / Token ID (first prefill pass)")
     print("=" * 60)
 
-    # Sanity check: print actual values of first few tokens for layer0_q_pre_norm
-    # to determine whether sample mismatch or weight bit-level difference
+    for name in sorted(LOGIT_NAMES & set(common)):
+        # SG: use the logit from the first prefill forward pass
+        if prefill_idx is not None:
+            entry = get_sg_logit_for_prefill(sg[name], prefill_idx)
+            if entry is None:
+                entry = sg[name][0]  # fallback
+            sg_idx, sg_path = entry
+        else:
+            sg_idx, sg_path = sg[name][0]
+
+        sg_t = load(sg_path)
+
+        # TR: first entry
+        tr_idx, tr_path = tr[name][0]
+        tr_t = load(tr_path)
+
+        print(f"\n[{name}]  sg_idx={sg_idx}  tr_idx={tr_idx}")
+        print(f"  SG shape={tuple(sg_t.shape)}  TR shape={tuple(tr_t.shape)}")
+
+        # TR may have N_resp > 1; take first row only for 1:1 comparison
+        if tr_t.ndim >= 1 and tr_t.shape[0] > sg_t.shape[0]:
+            tr_t = tr_t[:sg_t.shape[0]]
+            print(f"  (TR sliced to first {sg_t.shape[0]} row(s) for comparison)")
+
+        if name == "next_token_id":
+            print(f"  SG={sg_t.tolist()}  TR={tr_t.tolist()}")
+
+        report(sg_t, tr_t)
+
+    # ================================================================
+    # 2. Attention intermediates — prefill comparison
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("2. Attention intermediates (SG prefill[:P] vs TR[:P])")
+    print("=" * 60)
+
+    attn_names = sorted(set(common) - LOGIT_NAMES)
+
+    # Sanity check: print raw values for layer0_q_pre_norm
     sanity_name = "layer0_q_pre_norm"
     if sanity_name in sg and sanity_name in tr:
-        sanity_check_sample_alignment(sanity_name, sg[sanity_name], tr[sanity_name])
+        sg_pf = None
+        for idx, p in sg[sanity_name]:
+            t = load(p)
+            if t.ndim >= 2 and t.shape[0] > 1:
+                sg_pf = t
+                break
+        if sg_pf is not None:
+            tr_t = load(tr[sanity_name][0][1])
+            P = min(sg_pf.shape[0], tr_t.shape[0])
+            D = min(8, sg_pf.shape[-1])
+            print(f"\n[sanity check: {sanity_name}]  P={P}")
+            print(f"  (if values are close → same sample, precision diff)")
+            print(f"  (if values are totally different → wrong sample pairing)")
+            for tok in range(min(3, P)):
+                sv = "  ".join(f"{v:+.4f}" for v in sg_pf[tok, :D].float().tolist())
+                tv = "  ".join(f"{v:+.4f}" for v in tr_t[tok, :D].float().tolist())
+                dv = "  ".join(
+                    f"{v:+.4f}"
+                    for v in (sg_pf[tok, :D].float() - tr_t[tok, :D].float()).tolist()
+                )
+                print(f"  tok[{tok}] SG= {sv}")
+                print(f"  tok[{tok}] TR= {tv}")
+                print(f"  tok[{tok}] Δ = {dv}")
 
-    for name in sorted(ATTN_INTERMEDIATE_NAMES & set(common)):
-        compare_attn_intermediate(name, sg[name], tr[name])
+    for name in attn_names:
+        # SG: find first prefill (shape[0] > 1)
+        sg_prefill = None
+        sg_idx = None
+        for idx, p in sg[name]:
+            t = load(p)
+            if t.ndim >= 2 and t.shape[0] > 1:
+                sg_prefill = t
+                sg_idx = idx
+                break
+
+        if sg_prefill is None:
+            print(f"\n[{name}]  SKIP (no prefill in SG)")
+            continue
+
+        # TR: first entry
+        tr_idx, tr_path = tr[name][0]
+        tr_t = load(tr_path)
+
+        P = min(sg_prefill.shape[0], tr_t.shape[0])
+
+        print(
+            f"\n[{name}]  sg_idx={sg_idx} ({tuple(sg_prefill.shape)})  "
+            f"tr_idx={tr_idx} ({tuple(tr_t.shape)})  P={P}"
+        )
+        report(sg_prefill[:P], tr_t[:P])
 
 
 if __name__ == "__main__":
-    import datetime
-    import sys
-
-    SG_DIR, TR_DIR = resolve_latest_dump_pair()
-
     RESULTS_DIR = Path(__file__).parent / "results"
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    sg_tag = SG_DIR.name.replace("sglang_dump_", "sg")
-    tr_tag = TR_DIR.name.replace("sglang_dump_", "tr")
-    out_path = RESULTS_DIR / f"{timestamp}__{sg_tag}__{tr_tag}.txt"
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    sg_dir, tr_dir = find_pair()
+    sg_tag = sg_dir.name.replace("sglang_dump_", "sg")
+    tr_tag = tr_dir.name.replace("sglang_dump_", "tr")
+    out_path = RESULTS_DIR / f"{ts}__{sg_tag}__{tr_tag}.txt"
 
     class Tee:
-        def __init__(self, *streams):
-            self.streams = streams
-        def write(self, data):
-            for s in self.streams:
-                s.write(data)
+        def __init__(self, *s):
+            self.s = s
+        def write(self, d):
+            for s in self.s:
+                s.write(d)
         def flush(self):
-            for s in self.streams:
+            for s in self.s:
                 s.flush()
 
     with open(out_path, "w") as f:
         sys.stdout = Tee(sys.__stdout__, f)
         try:
-            main(SG_DIR, TR_DIR)
+            main()
         finally:
             sys.stdout = sys.__stdout__
 
