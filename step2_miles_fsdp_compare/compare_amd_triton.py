@@ -16,19 +16,18 @@ Strategy B — attention intermediate tensors
   same positions → should be bit-wise identical under true-on-policy.
 
 Usage:
-  Update SG_DIR / TR_DIR below, then:
   python /app/true_on_policy/amd-top-test/step2_miles_fsdp_compare/compare_amd_triton.py
 """
 from pathlib import Path
 import re
 import collections
+import os
 
 import torch
 
-# ===== Update these per run =====
-RUN_DIR = Path("/app/true_on_policy/results/miles_fsdp_debug_v2")
-SG_DIR = RUN_DIR / "dumps" / "sglang_dump_1772746622.1748765"   # SGLang inference
-TR_DIR = RUN_DIR / "dumps" / "sglang_dump_1772746644.48004"     # FSDP training
+# ===== Auto-discovery root (override with env COMPARE_RUN_DIR if needed) =====
+RUN_DIR = Path(os.environ.get("COMPARE_RUN_DIR", "/app/true_on_policy/results/miles_fsdp_debug_v2"))
+DUMPS_DIR = RUN_DIR / "dumps"
 
 DIFF_THRESHOLD = 1e-3
 
@@ -53,6 +52,64 @@ ATTN_INTERMEDIATE_NAMES = {
 _PAT = re.compile(
     r"forward_pass_id=(\d+)___rank=(\d+)___name=(.*?)___dump_index=(\d+)\.pt$"
 )
+
+
+def _read_first_rank0_tensor_shape(dump_dir: Path, name: str):
+    pts = sorted(dump_dir.glob(f"*___rank=0___name={name}___dump_index=*.pt"))
+    if not pts:
+        return None
+    t = load_pt(pts[0])
+    return tuple(t.shape)
+
+
+def _classify_dump_dir(dump_dir: Path) -> str:
+    """
+    Heuristic role detection:
+    - SG dump usually has input_ids_for_compare and next_token_id shape (1,)
+    - TR/HF dump usually has next_token_id shape (N_resp,) where N_resp > 1
+    """
+    has_input_ids = any(dump_dir.glob("*___rank=0___name=input_ids_for_compare___dump_index=*.pt"))
+    next_id_shape = _read_first_rank0_tensor_shape(dump_dir, "next_token_id")
+
+    if has_input_ids:
+        return "SG"
+    if next_id_shape and len(next_id_shape) >= 1 and next_id_shape[0] > 1:
+        return "TR"
+    if next_id_shape and len(next_id_shape) >= 1 and next_id_shape[0] == 1:
+        return "SG"
+    return "UNKNOWN"
+
+
+def resolve_latest_dump_pair():
+    dump_dirs = sorted(
+        [p for p in DUMPS_DIR.glob("sglang_dump_*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not dump_dirs:
+        raise RuntimeError(f"No dump dirs found under: {DUMPS_DIR}")
+
+    sg_dirs = [d for d in dump_dirs if _classify_dump_dir(d) == "SG"]
+    tr_dirs = [d for d in dump_dirs if _classify_dump_dir(d) == "TR"]
+
+    if not sg_dirs or not tr_dirs:
+        raise RuntimeError(
+            f"Could not find both SG and TR dumps under {DUMPS_DIR}. "
+            f"SG={len(sg_dirs)} TR={len(tr_dirs)}"
+        )
+
+    # Pick the most recent available pair; tie-break by smaller time gap.
+    best = None
+    for sg in sg_dirs:
+        for tr in tr_dirs:
+            pair_latest = max(sg.stat().st_mtime, tr.stat().st_mtime)
+            pair_gap = abs(sg.stat().st_mtime - tr.stat().st_mtime)
+            score = (-pair_latest, pair_gap)
+            if best is None or score < best[0]:
+                best = (score, sg, tr)
+
+    assert best is not None
+    return best[1], best[2]
 
 
 def scan(d: Path):
@@ -298,12 +355,13 @@ def sanity_check_sample_alignment(name: str, sg_entries, tr_entries) -> None:
 # main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    print(f"SG_DIR = {SG_DIR}")
-    print(f"TR_DIR = {TR_DIR}\n")
+def main(sg_dir: Path, tr_dir: Path) -> None:
+    print(f"RUN_DIR = {RUN_DIR}")
+    print(f"SG_DIR = {sg_dir}")
+    print(f"TR_DIR = {tr_dir}\n")
 
-    sg = scan(SG_DIR)
-    tr = scan(TR_DIR)
+    sg = scan(sg_dir)
+    tr = scan(tr_dir)
 
     print(f"Inference unique names : {len(sg)}  (total files: {sum(len(v) for v in sg.values())})")
     print(f"Training  unique names : {len(tr)}  (total files: {sum(len(v) for v in tr.values())})")
@@ -343,6 +401,8 @@ if __name__ == "__main__":
     import datetime
     import sys
 
+    SG_DIR, TR_DIR = resolve_latest_dump_pair()
+
     RESULTS_DIR = Path(__file__).parent / "results"
     RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -364,7 +424,7 @@ if __name__ == "__main__":
     with open(out_path, "w") as f:
         sys.stdout = Tee(sys.__stdout__, f)
         try:
-            main()
+            main(SG_DIR, TR_DIR)
         finally:
             sys.stdout = sys.__stdout__
 
