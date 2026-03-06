@@ -39,18 +39,93 @@ SKIP_NAMES = {
 # Display raw tensor names directly (e.g. layer0_q_pre_norm).
 DISPLAY_NAMES = {}
 
-# Order for display (layer0 first, then last layer, then logits)
-DISPLAY_ORDER = [
-    "layer0_q_pre_norm", "layer0_k_pre_norm", "layer0_v_pre_norm",
-    "layer0_q_post_norm", "layer0_k_post_norm",
-    "layer0_q_post_rope", "layer0_k_post_rope",
-    "layer0_attn_context_before_o_proj", "layer0_attn_out_after_o_proj",
-    "q_pre_norm", "k_pre_norm", "v_pre_norm",
-    "q_post_norm", "k_post_norm",
-    "q_post_rope", "k_post_rope",
-    "attn_context_before_o_proj", "attn_out_last_layer",
-    "next_token_id",
-    "next_token_logprob_selected",
+DISPLAY_GROUPS = [
+    (
+        "== Layer0 / Prepare ==",
+        [
+            "layer0_attn_input_raw",
+            "layer0_attn_after_input_layernorm_only",
+            "layer0_attn_input_after_prepare",
+            "layer0_hidden_in",
+            "layer0_residual",
+        ],
+    ),
+    (
+        "== Layer0 / QKV+Norm+RoPE+Attn ==",
+        [
+            "layer0_q_pre_norm",
+            "layer0_k_pre_norm",
+            "layer0_v_pre_norm",
+            "layer0_q_norm_input_native",
+            "layer0_k_norm_input_native",
+            "layer0_q_post_norm_native",
+            "layer0_k_post_norm_native",
+            "layer0_q_post_norm",
+            "layer0_k_post_norm",
+            "layer0_q_post_rope",
+            "layer0_k_post_rope",
+            "layer0_attn_context_before_o_proj",
+            "layer0_attn_out",
+            "layer0_attn_out_after_o_proj",
+        ],
+    ),
+    (
+        "== Layer0 / Block ==",
+        [
+            "layer0_block_out_before_residual_add",
+            "layer0_block_out_after_residual_add",
+            "layer0_block_out",
+        ],
+    ),
+    (
+        "== Layer1 / Prepare+Attn+Block ==",
+        [
+            "layer1_attn_input_raw",
+            "layer1_attn_after_input_layernorm_only",
+            "layer1_attn_input_after_prepare",
+            "layer1_hidden_in",
+            "layer1_residual",
+            "layer1_q_pre_norm",
+            "layer1_k_pre_norm",
+            "layer1_v_pre_norm",
+            "layer1_q_post_norm",
+            "layer1_k_post_norm",
+            "layer1_q_post_rope",
+            "layer1_k_post_rope",
+            "layer1_attn_context_before_o_proj",
+            "layer1_attn_out",
+            "layer1_attn_out_after_o_proj",
+            "layer1_block_out_before_residual_add",
+            "layer1_block_out_after_residual_add",
+            "layer1_block_out",
+        ],
+    ),
+    (
+        "== Last Layer / QKV+Norm+RoPE+Attn ==",
+        [
+            "attn_input_last_layer",
+            "q_pre_norm",
+            "k_pre_norm",
+            "v_pre_norm",
+            "q_norm_input_native",
+            "k_norm_input_native",
+            "q_post_norm_native",
+            "k_post_norm_native",
+            "q_post_norm",
+            "k_post_norm",
+            "q_post_rope",
+            "k_post_rope",
+            "attn_context_before_o_proj",
+            "attn_out_last_layer",
+        ],
+    ),
+    (
+        "== Tokens / Logprob ==",
+        [
+            "next_token_id",
+            "next_token_logprob_selected",
+        ],
+    ),
 ]
 
 
@@ -133,6 +208,21 @@ def get_sg_entry(entries: list, prefill_idx: int, is_logit: bool) -> tuple:
     return entries[0] if entries else None
 
 
+def build_grouped_order(common: set[str]):
+    grouped = []
+    used = set()
+    for title, names in DISPLAY_GROUPS:
+        present = [n for n in names if n in common]
+        if present:
+            grouped.append((title, present))
+            used.update(present)
+
+    extra = sorted(common - used)
+    if extra:
+        grouped.append(("== Other ==", extra))
+    return grouped
+
+
 def main():
     sg_dir, tr_dir = find_pair()
     print(f"SG = {sg_dir.name}")
@@ -144,69 +234,70 @@ def main():
     prefill_idx = find_first_prefill_idx(sg)
 
     common = set(sg) & set(tr) - SKIP_NAMES
-    # Sort by display order, then alphabetically for anything not in the list
-    ordered = [n for n in DISPLAY_ORDER if n in common]
-    ordered += sorted(common - set(DISPLAY_ORDER))
+    grouped_order = build_grouped_order(common)
 
-    if not ordered:
+    if not grouped_order:
         print("ERROR: no common tensor names to compare")
         return
 
-    for name in ordered:
-        display = DISPLAY_NAMES.get(name, name)
-        is_logit = name.startswith("next_token_")
+    for title, names in grouped_order:
+        print(title)
+        for name in names:
+            display = DISPLAY_NAMES.get(name, name)
+            is_logit = name.startswith("next_token_")
 
-        # Pick SG tensor
-        if is_logit:
-            sg_idx, sg_path = get_sg_entry(sg[name], prefill_idx, is_logit=True)
-            sg_t = load(sg_path)
-        else:
-            # Find first prefill entry (shape[0] > 1)
-            sg_t = None
-            for idx, p in sg[name]:
-                t = load(p)
-                if t.ndim >= 2 and t.shape[0] > 1:
-                    sg_t = t
-                    break
-            if sg_t is None:
-                continue  # no prefill data
+            # Pick SG tensor
+            if is_logit:
+                sg_idx, sg_path = get_sg_entry(sg[name], prefill_idx, is_logit=True)
+                sg_t = load(sg_path)
+            else:
+                # Find first prefill entry (shape[0] > 1)
+                sg_t = None
+                for idx, p in sg[name]:
+                    t = load(p)
+                    if t.ndim >= 2 and t.shape[0] > 1:
+                        sg_t = t
+                        break
+                if sg_t is None:
+                    continue  # no prefill data
 
-        # Pick TR tensor
-        tr_t = load(tr[name][0][1])
+            # Pick TR tensor
+            tr_t = load(tr[name][0][1])
 
-        # Align shapes
-        if is_logit and tr_t.ndim >= 1 and tr_t.shape[0] > sg_t.shape[0]:
-            tr_t = tr_t[:sg_t.shape[0]]
-        elif not is_logit:
-            P = min(sg_t.shape[0], tr_t.shape[0])
-            sg_t = sg_t[:P]
-            tr_t = tr_t[:P]
-            sg_t, tr_t = _align_non_logit_shapes(sg_t, tr_t)
+            # Align shapes
+            if is_logit and tr_t.ndim >= 1 and tr_t.shape[0] > sg_t.shape[0]:
+                tr_t = tr_t[:sg_t.shape[0]]
+            elif not is_logit:
+                P = min(sg_t.shape[0], tr_t.shape[0])
+                sg_t = sg_t[:P]
+                tr_t = tr_t[:P]
+                sg_t, tr_t = _align_non_logit_shapes(sg_t, tr_t)
 
-        if sg_t.shape != tr_t.shape:
-            print(f"❌ {display}  shape_mismatch SG={tuple(sg_t.shape)} TR={tuple(tr_t.shape)}  "
-                  f"[{str(sg_t.dtype).replace('torch.', '')} vs {str(tr_t.dtype).replace('torch.', '')}]")
-            continue
+            if sg_t.shape != tr_t.shape:
+                print(f"❌ {display}  shape_mismatch SG={tuple(sg_t.shape)} TR={tuple(tr_t.shape)}  "
+                      f"[{str(sg_t.dtype).replace('torch.', '')} vs {str(tr_t.dtype).replace('torch.', '')}]")
+                continue
 
-        # Compare
-        eq = torch.equal(sg_t, tr_t)
-        tag = "✅" if eq else "❌"
+            # Compare
+            eq = torch.equal(sg_t, tr_t)
+            tag = "✅" if eq else "❌"
 
-        def short_dtype(t):
-            return str(t.dtype).replace("torch.", "")
+            def short_dtype(t):
+                return str(t.dtype).replace("torch.", "")
 
-        dtypes = f"  [{short_dtype(sg_t)} vs {short_dtype(tr_t)}]"
+            dtypes = f"  [{short_dtype(sg_t)} vs {short_dtype(tr_t)}]"
 
-        if eq:
-            print(f"{tag} {display}{dtypes}")
-        elif name == "next_token_id":
-            print(f"{tag} {display}  SG={sg_t.tolist()}  TR={tr_t.tolist()}{dtypes}")
-        elif sg_t.is_floating_point():
-            d = (sg_t.float() - tr_t.float()).abs()
-            print(f"{tag} {display}  max={d.max().item():.3e}  mean={d.mean().item():.3e}{dtypes}")
-        else:
-            neq = int((sg_t != tr_t).sum())
-            print(f"{tag} {display}  mismatched={neq}/{sg_t.numel()}{dtypes}")
+            if eq:
+                print(f"{tag} {display}{dtypes}")
+            elif name == "next_token_id":
+                print(f"{tag} {display}  SG={sg_t.tolist()}  TR={tr_t.tolist()}{dtypes}")
+            elif sg_t.is_floating_point():
+                d = (sg_t.float() - tr_t.float()).abs()
+                print(f"{tag} {display}  max={d.max().item():.3e}  mean={d.mean().item():.3e}{dtypes}")
+            else:
+                neq = int((sg_t != tr_t).sum())
+                print(f"{tag} {display}  mismatched={neq}/{sg_t.numel()}{dtypes}")
+        print()
 
 
 if __name__ == "__main__":
