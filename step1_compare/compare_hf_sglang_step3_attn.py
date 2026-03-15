@@ -1,31 +1,117 @@
 #!/usr/bin/env python3
-import argparse
-import re
 from pathlib import Path
+import re
 
 import torch
+# ====== 按你当前这轮实验日志更新 ======
+# HF dump (day0 脚本侧): partial_name=1772572455.926678
+# SG dump (server 侧):   partial_name=1772572442.1473558
+HF_DIR = Path("/tmp/dumper/sglang_dump_1772572455.926678")
+SG_DIR = Path("/tmp/dumper/sglang_dump_1772572442.1473558")
 
-DUMPER_ROOT = Path("/tmp/dumper")
+# ====== 按你的当前实验修改这些 index 映射 ======
+HF_INDEX = {
+    # 本轮 HF 未 dump 这两项
+    "input_ids_for_compare": -1,
+    "embedding_output": -1,
+    "layer0_positions": 1,
+    "layer0_attn_input_raw": 2,
+    # 本轮 HF 未单独 dump 该点，直接 skip
+    "layer0_attn_after_input_layernorm_only": -1,
+    "layer0_attn_input_after_prepare": 3,
+    "layer0_hidden_component_after_postprocess": 16,
+    "layer0_decoder_output_full": 17,
+    "layer8_attn_input_after_prepare": -1,
+    "layer8_hidden_component_after_postprocess": -1,
+    "layer8_decoder_output_full": -1,
+    "layer16_attn_input_after_prepare": -1,
+    "layer16_hidden_component_after_postprocess": -1,
+    "layer16_decoder_output_full": -1,
+    "layer24_attn_input_after_prepare": -1,
+    "layer24_hidden_component_after_postprocess": -1,
+    "layer24_decoder_output_full": -1,
+    "layer32_attn_input_after_prepare": -1,
+    "layer32_hidden_component_after_postprocess": -1,
+    "layer32_decoder_output_full": -1,
+    "attn_input_last_layer": 18,
+    "q_pre_norm": 19,
+    "k_pre_norm": 20,
+    "v_pre_norm": 21,
+    # 本轮 HF 仍未产出这 4 个 last-layer post 点
+    "q_post_norm": -1,
+    "k_post_norm": -1,
+    "q_post_rope": -1,
+    "k_post_rope": -1,
+    "attn_context_before_o_proj": 22,
+    "attn_out_last_layer": 23,
+    "final_hidden_before_lm_head": 24,
+    "lm_head_weight": 25,
+    # layer0 细粒度点
+    "layer0_attn_context_before_o_proj": 4,
+    "layer0_attn_out_after_o_proj": 5,
+    "layer0_q_pre_norm": 6,
+    "layer0_k_pre_norm": 7,
+    "layer0_v_pre_norm": 8,
+    "layer0_q_post_norm": 9,
+    "layer0_k_post_norm": 10,
+    "layer0_q_post_rope": 11,
+    "layer0_k_post_rope": 12,
+    "layer0_after_attn_residual_add": 13,
+    "layer0_post_attention_layernorm_output": 14,
+    "layer0_mlp_output": 15,
+}
 
-NAME_ORDER = [
-    "input_ids_for_compare",
-    "embedding_output",
-    "layer0_positions",
-    "layer0_attn_input_raw",
-    "layer0_attn_input_after_prepare",
-    "attn_input_last_layer",
-    "q_pre_norm",
-    "k_pre_norm",
-    "v_pre_norm",
-    "q_post_norm",
-    "k_post_norm",
-    "q_post_rope",
-    "k_post_rope",
-    "attn_context_before_o_proj",
-    "attn_out_last_layer",
-    "final_hidden_before_lm_head",
-    "lm_head_weight",
-]
+SG_INDEX = {
+    "input_ids_for_compare": 1,
+    "embedding_output": 2,
+    "layer0_attn_input_raw": 3,
+    "layer0_positions": 4,
+    "layer0_attn_after_input_layernorm_only": 5,
+    "layer0_attn_input_after_prepare": 6,  # 6/7 都是该点，取第一处
+    "layer0_hidden_component_after_postprocess": 20,
+    "layer0_decoder_output_full": 21,
+    "layer8_attn_input_after_prepare": -1,
+    "layer8_hidden_component_after_postprocess": -1,
+    "layer8_decoder_output_full": -1,
+    "layer16_attn_input_after_prepare": -1,
+    "layer16_hidden_component_after_postprocess": -1,
+    "layer16_decoder_output_full": -1,
+    "layer24_attn_input_after_prepare": -1,
+    "layer24_hidden_component_after_postprocess": -1,
+    "layer24_decoder_output_full": -1,
+    "layer32_attn_input_after_prepare": -1,
+    "layer32_hidden_component_after_postprocess": -1,
+    "layer32_decoder_output_full": -1,
+    "attn_input_last_layer": 22,
+    "q_pre_norm": 23,
+    "k_pre_norm": 24,
+    "v_pre_norm": 25,
+    "q_post_norm": 26,
+    "k_post_norm": 27,
+    "q_post_rope": 28,
+    "k_post_rope": 29,
+    "attn_context_before_o_proj": 30,
+    "attn_out_last_layer": 31,
+    "final_hidden_before_lm_head": 32,
+    "lm_head_weight": 33,
+    # layer0 细粒度点
+    "layer0_q_pre_norm": 8,
+    "layer0_k_pre_norm": 9,
+    "layer0_v_pre_norm": 10,
+    "layer0_q_post_norm": 11,
+    "layer0_k_post_norm": 12,
+    "layer0_q_post_rope": 13,
+    "layer0_k_post_rope": 14,
+    "layer0_attn_context_before_o_proj": 15,
+    "layer0_attn_out_after_o_proj": 16,
+    "layer0_after_attn_residual_add": 17,
+    "layer0_post_attention_layernorm_output": 18,
+    "layer0_mlp_output": 19,
+}
+
+# 允许同一个“逻辑对比名”在两侧使用不同的 dump 文件名
+# 这里把 HF 的 layer0_attn_after_input_layernorm_only 映射到其现有命名。
+HF_NAME_OVERRIDE = {}
 
 # True: 将 hidden/attention 类张量统一对齐到“单步语义”
 # - [B, T, D] -> [B, D]（取最后一步）
@@ -33,6 +119,33 @@ NAME_ORDER = [
 ALIGN_TO_SINGLE_STEP = True
 
 ALIGN_NAMES = {
+    "layer0_attn_input_after_prepare",
+    "layer0_attn_context_before_o_proj",
+    "layer0_attn_out_after_o_proj",
+    "layer0_q_pre_norm",
+    "layer0_k_pre_norm",
+    "layer0_v_pre_norm",
+    "layer0_q_post_norm",
+    "layer0_k_post_norm",
+    "layer0_q_post_rope",
+    "layer0_k_post_rope",
+    "layer0_after_attn_residual_add",
+    "layer0_post_attention_layernorm_output",
+    "layer0_mlp_output",
+    "layer0_hidden_component_after_postprocess",
+    "layer0_decoder_output_full",
+    "layer8_attn_input_after_prepare",
+    "layer8_hidden_component_after_postprocess",
+    "layer8_decoder_output_full",
+    "layer16_attn_input_after_prepare",
+    "layer16_hidden_component_after_postprocess",
+    "layer16_decoder_output_full",
+    "layer24_attn_input_after_prepare",
+    "layer24_hidden_component_after_postprocess",
+    "layer24_decoder_output_full",
+    "layer32_attn_input_after_prepare",
+    "layer32_hidden_component_after_postprocess",
+    "layer32_decoder_output_full",
     "attn_input_last_layer",
     "q_pre_norm",
     "k_pre_norm",
@@ -58,7 +171,34 @@ SQUEEZE_BATCH1_NAMES = {
     "embedding_output",
     "layer0_positions",
     "layer0_attn_input_raw",
+    "layer0_attn_after_input_layernorm_only",
     "layer0_attn_input_after_prepare",
+    "layer0_attn_context_before_o_proj",
+    "layer0_attn_out_after_o_proj",
+    "layer0_q_pre_norm",
+    "layer0_k_pre_norm",
+    "layer0_v_pre_norm",
+    "layer0_q_post_norm",
+    "layer0_k_post_norm",
+    "layer0_q_post_rope",
+    "layer0_k_post_rope",
+    "layer0_after_attn_residual_add",
+    "layer0_post_attention_layernorm_output",
+    "layer0_mlp_output",
+    "layer0_hidden_component_after_postprocess",
+    "layer0_decoder_output_full",
+    "layer8_attn_input_after_prepare",
+    "layer8_hidden_component_after_postprocess",
+    "layer8_decoder_output_full",
+    "layer16_attn_input_after_prepare",
+    "layer16_hidden_component_after_postprocess",
+    "layer16_decoder_output_full",
+    "layer24_attn_input_after_prepare",
+    "layer24_hidden_component_after_postprocess",
+    "layer24_decoder_output_full",
+    "layer32_attn_input_after_prepare",
+    "layer32_hidden_component_after_postprocess",
+    "layer32_decoder_output_full",
     "attn_input_last_layer",
     "q_pre_norm",
     "k_pre_norm",
@@ -72,59 +212,26 @@ SQUEEZE_BATCH1_NAMES = {
     "final_hidden_before_lm_head",
 }
 
-FILE_RE = re.compile(
-    r"^forward_pass_id=0___rank=0___name=(?P<name>.+)___dump_index=(?P<index>\d+)\.pt$"
-)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Compare HF and SGLang dumper tensors around the attention path."
-    )
-    parser.add_argument("--hf-dir", type=Path, default=None)
-    parser.add_argument("--sg-dir", type=Path, default=None)
-    parser.add_argument(
-        "--focus",
-        nargs="*",
-        default=[
-            "q_post_norm",
-            "k_post_norm",
-            "q_post_rope",
-            "k_post_rope",
-        ],
-        help="Names to compare. Defaults to the key norm/rope checkpoints.",
-    )
-    parser.add_argument(
-        "--list-latest",
-        action="store_true",
-        help="Print available dump directories under /tmp/dumper and exit.",
-    )
-    return parser.parse_args()
-
-
-def list_dump_dirs(root: Path) -> list[Path]:
-    return sorted(
-        [p for p in root.glob("sglang_dump_*") if p.is_dir()],
-        key=lambda p: p.stat().st_mtime,
-    )
-
-
-def discover_index_map(dump_dir: Path) -> dict[str, int]:
-    index_map: dict[str, int] = {}
-    for path in dump_dir.glob("forward_pass_id=0___rank=0___name=*___dump_index=*.pt"):
-        match = FILE_RE.match(path.name)
-        if match is None:
-            continue
-        name = match.group("name")
-        index = int(match.group("index"))
-        index_map[name] = index
-    return index_map
-
 
 def load_value(d: Path, name: str, idx: int) -> torch.Tensor:
     p = d / f"forward_pass_id=0___rank=0___name={name}___dump_index={idx}.pt"
     obj = torch.load(p, weights_only=False, map_location="cpu")
     return obj["value"] if isinstance(obj, dict) and "value" in obj else obj
+
+
+def resolve_index(d: Path, name: str, idx: int) -> int:
+    if idx > 0:
+        return idx
+    pattern = f"forward_pass_id=0___rank=0___name={name}___dump_index=*.pt"
+    candidates = list(d.glob(pattern))
+    if not candidates:
+        return idx
+    best = -1
+    for p in candidates:
+        m = re.search(r"dump_index=(\d+)\.pt$", p.name)
+        if m:
+            best = max(best, int(m.group(1)))
+    return best if best > 0 else idx
 
 
 def align_single_step(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -153,93 +260,11 @@ def normalize_for_compare(name: str, x: torch.Tensor, side: str) -> torch.Tensor
     return x
 
 
-def squeeze_single_step_tail(x: torch.Tensor) -> torch.Tensor:
-    if x.ndim == 2 and x.shape[0] == 1:
-        return x[0]
-    return x
-
-
-def head_layout_sanity_compare(name: str, x_hf: torch.Tensor, x_sg: torch.Tensor) -> None:
-    layout = {
-        "q_pre_norm": (32, 128),
-        "k_pre_norm": (8, 128),
-    }.get(name)
-    if layout is None or x_hf.ndim != 1 or x_sg.ndim != 1:
-        return
-
-    num_heads, head_dim = layout
-    expected = num_heads * head_dim
-    if x_hf.numel() != expected or x_sg.numel() != expected:
-        return
-
-    hf_heads = x_hf.float().reshape(num_heads, head_dim)
-    sg_heads = x_sg.float().reshape(num_heads, head_dim)
-    direct_diff = (hf_heads - sg_heads).abs()
-    print("  head-level direct diff max_abs:", direct_diff.max().item())
-    print("  head-level direct diff mean_abs:", direct_diff.mean().item())
-
-    hf_transposed = hf_heads.transpose(0, 1).reshape(-1)
-    transpose_diff = (hf_transposed - x_sg.float().reshape(-1)).abs()
-    print("  transpose sanity before mean_abs:", direct_diff.mean().item())
-    print("  transpose sanity after mean_abs:", transpose_diff.mean().item())
-
-
-def compute_canonical_tensor(
-    name: str,
-    dump_dir: Path,
-    index_map: dict[str, int],
-    side: str,
-) -> torch.Tensor | None:
-    idx = index_map.get(name, -1)
-    if idx <= 0:
-        return None
-    try:
-        x = load_value(dump_dir, name, idx)
-    except FileNotFoundError:
-        return None
-    x = normalize_for_compare(name, x, side=side)
-    x = align_single_step(name, x)
-    x = squeeze_single_step_tail(x)
-    return x
-
-
-def compare_rope_delta(
-    base_name: str,
-    rope_name: str,
-    label: str,
-    hf_dir: Path,
-    sg_dir: Path,
-    hf_index: dict[str, int],
-    sg_index: dict[str, int],
-) -> None:
-    hf_base = compute_canonical_tensor(base_name, hf_dir, hf_index, side="hf")
-    hf_rope = compute_canonical_tensor(rope_name, hf_dir, hf_index, side="hf")
-    sg_base = compute_canonical_tensor(base_name, sg_dir, sg_index, side="sg")
-    sg_rope = compute_canonical_tensor(rope_name, sg_dir, sg_index, side="sg")
-
-    print(f"\n[{label}]")
-    if any(x is None for x in [hf_base, hf_rope, sg_base, sg_rope]):
-        print("  -> skip (missing tensor)")
-        return
-
-    hf_delta = hf_rope - hf_base
-    sg_delta = sg_rope - sg_base
-
-    print("  hf shape/dtype:", tuple(hf_delta.shape), hf_delta.dtype)
-    print("  sg shape/dtype:", tuple(sg_delta.shape), sg_delta.dtype)
-
-    if hf_delta.shape != sg_delta.shape:
-        print("  -> shape mismatch, skip")
-        return
-
-    diff = (hf_delta.float() - sg_delta.float()).abs()
-    print("  max_abs:", diff.max().item())
-    print("  mean_abs:", diff.mean().item())
-
-
-def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_index: dict[str, int]) -> None:
-    hf_idx = hf_index.get(name, -1)
-    sg_idx = sg_index.get(name, -1)
+def compare(name: str) -> None:
+    hf_idx = resolve_index(HF_DIR, HF_NAME_OVERRIDE.get(name, name), HF_INDEX[name])
+    sg_idx = resolve_index(SG_DIR, name, SG_INDEX[name])
+    hf_name = HF_NAME_OVERRIDE.get(name, name)
+    sg_name = name
 
     print(f"\n[{name}]")
     if hf_idx <= 0 or sg_idx <= 0:
@@ -247,8 +272,8 @@ def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_
         return
 
     try:
-        x_hf = load_value(hf_dir, name, hf_idx)
-        x_sg = load_value(sg_dir, name, sg_idx)
+        x_hf = load_value(HF_DIR, hf_name, hf_idx)
+        x_sg = load_value(SG_DIR, sg_name, sg_idx)
     except FileNotFoundError as e:
         print(f"  -> file missing, skip: {e}")
         return
@@ -257,8 +282,6 @@ def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_
     x_sg = normalize_for_compare(name, x_sg, side="sg")
     x_hf = align_single_step(name, x_hf)
     x_sg = align_single_step(name, x_sg)
-    x_hf = squeeze_single_step_tail(x_hf)
-    x_sg = squeeze_single_step_tail(x_sg)
 
     print("  hf shape/dtype:", tuple(x_hf.shape), x_hf.dtype)
     print("  sg shape/dtype:", tuple(x_sg.shape), x_sg.dtype)
@@ -276,40 +299,65 @@ def compare(name: str, hf_dir: Path, sg_dir: Path, hf_index: dict[str, int], sg_
         diff = (x_hf.float() - x_sg.float()).abs()
         print("  max_abs:", diff.max().item())
         print("  mean_abs:", diff.mean().item())
-        head_layout_sanity_compare(name, x_hf, x_sg)
     else:
         neq = (x_hf != x_sg).sum().item()
         print("  neq_cnt:", neq)
 
 
 def main() -> None:
-    args = parse_args()
-    dump_dirs = list_dump_dirs(DUMPER_ROOT)
-    if args.list_latest:
-        for dump_dir in dump_dirs:
-            print(dump_dir)
-        return
-
-    hf_dir = args.hf_dir or (dump_dirs[-1] if dump_dirs else None)
-    sg_dir = args.sg_dir or (dump_dirs[-2] if len(dump_dirs) >= 2 else None)
-    if hf_dir is None or sg_dir is None:
-        raise SystemExit("Need at least two dump directories or pass --hf-dir and --sg-dir explicitly.")
-
-    hf_index = discover_index_map(hf_dir)
-    sg_index = discover_index_map(sg_dir)
-
-    print("HF_DIR =", hf_dir)
-    print("SG_DIR =", sg_dir)
+    print("HF_DIR =", HF_DIR)
+    print("SG_DIR =", SG_DIR)
     print("ALIGN_TO_SINGLE_STEP =", ALIGN_TO_SINGLE_STEP)
-    print("FOCUS =", args.focus)
-    print("HF_INDEX =", {name: hf_index.get(name, -1) for name in NAME_ORDER})
-    print("SG_INDEX =", {name: sg_index.get(name, -1) for name in NAME_ORDER})
 
-    for name in args.focus:
-        compare(name, hf_dir, sg_dir, hf_index, sg_index)
-
-    compare_rope_delta("q_post_norm", "q_post_rope", "delta_q", hf_dir, sg_dir, hf_index, sg_index)
-    compare_rope_delta("k_post_norm", "k_post_rope", "delta_k", hf_dir, sg_dir, hf_index, sg_index)
+    for name in [
+        # "input_ids_for_compare",
+        # "embedding_output",
+        # ---------------- layer0 inner ----------------
+        "layer0_positions",
+        "layer0_attn_input_raw",
+        "layer0_attn_after_input_layernorm_only",
+        "layer0_attn_input_after_prepare",
+        "layer0_q_pre_norm",
+        "layer0_k_pre_norm",
+        "layer0_v_pre_norm",
+        "layer0_q_post_norm",
+        "layer0_k_post_norm",
+        "layer0_q_post_rope",
+        "layer0_k_post_rope",
+        "layer0_attn_context_before_o_proj",
+        "layer0_attn_out_after_o_proj",
+        "layer0_after_attn_residual_add",
+        "layer0_post_attention_layernorm_output",
+        "layer0_mlp_output",
+        "layer0_hidden_component_after_postprocess",
+        "layer0_decoder_output_full",
+        # "layer8_attn_input_after_prepare",
+        # "layer8_hidden_component_after_postprocess",
+        # "layer8_decoder_output_full",
+        # "layer16_attn_input_after_prepare",
+        # "layer16_hidden_component_after_postprocess",
+        # "layer16_decoder_output_full",
+        # "layer24_attn_input_after_prepare",
+        # "layer24_hidden_component_after_postprocess",
+        # "layer24_decoder_output_full",
+        # "layer32_attn_input_after_prepare",
+        # "layer32_hidden_component_after_postprocess",
+        # "layer32_decoder_output_full",
+        # ---------------- last layer ----------------
+        "attn_input_last_layer",
+        "q_pre_norm",
+        "k_pre_norm",
+        "v_pre_norm",
+        "q_post_norm",
+        "k_post_norm",
+        "q_post_rope",
+        "k_post_rope",
+        "attn_context_before_o_proj",
+        "attn_out_last_layer",
+        "final_hidden_before_lm_head",
+        "lm_head_weight",
+    ]:
+        compare(name)
 
 
 if __name__ == "__main__":

@@ -33,13 +33,6 @@ DEFAULT_ENV_KEYS = [
 ]
 
 
-def _bool_env(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 @dataclass
 class CompareSummary:
     total: int
@@ -52,6 +45,8 @@ class CompareSummary:
 
 
 _dumper = None
+# _HF_LAYER_PROBE_IDS = {0, 8, 16, 24, 32, 40}
+_HF_LAYER_PROBE_IDS = {0}
 
 
 def _maybe_dump(name: str, value: torch.Tensor) -> None:
@@ -107,7 +102,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", type=str, default=None)
     parser.add_argument("--save-detail", type=str, default=None)
     parser.add_argument("--manifest-json", type=str, default=None)
-    parser.add_argument("--hf-hook-debug", action="store_true")
     return parser.parse_args()
 
 
@@ -280,45 +274,6 @@ def _save_detail(path: str | Path, details: list[dict[str, Any]], summary: Compa
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _snapshot_dump_dirs(root: str | Path = "/tmp/dumper") -> dict[str, tuple[int, int]]:
-    root = Path(root)
-    snapshot: dict[str, tuple[int, int]] = {}
-    if not root.exists():
-        return snapshot
-    for dump_dir in root.glob("sglang_dump_*"):
-        if not dump_dir.is_dir():
-            continue
-        latest_mtime_ns = 0
-        file_count = 0
-        for path in dump_dir.glob("*.pt"):
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-            file_count += 1
-        snapshot[str(dump_dir)] = (latest_mtime_ns, file_count)
-    return snapshot
-
-
-def _describe_dump_dir_changes(
-    before: dict[str, tuple[int, int]],
-    after: dict[str, tuple[int, int]],
-) -> dict[str, list[str]]:
-    created = sorted(set(after) - set(before))
-    touched = []
-    for dump_dir, after_state in after.items():
-        before_state = before.get(dump_dir)
-        if before_state is None:
-            continue
-        if after_state != before_state:
-            touched.append(dump_dir)
-    return {
-        "created": created,
-        "touched": sorted(touched),
-    }
-
-
 def sglang_generate_with_logprobs(
     host: str,
     port: int,
@@ -326,7 +281,6 @@ def sglang_generate_with_logprobs(
     sampling_params: dict[str, Any],
 ) -> tuple[list[int], list[float], list[int], list[str]]:
     base_url = f"http://{host}:{port}"
-    dump_dirs_before = _snapshot_dump_dirs()
     payload = {
         "input_ids": prompt_ids,
         "sampling_params": sampling_params,
@@ -335,10 +289,6 @@ def sglang_generate_with_logprobs(
         "stream": False,
     }
     response = requests.post(f"{base_url}/generate", json=payload, timeout=120)
-    dump_dirs_after = _snapshot_dump_dirs()
-    dump_changes = _describe_dump_dir_changes(dump_dirs_before, dump_dirs_after)
-    print(f"[SGLang dump] created_dirs={dump_changes['created']}")
-    print(f"[SGLang dump] touched_dirs={dump_changes['touched']}")
     if response.status_code != 200:
         raise RuntimeError(f"SGLang request failed: {response.status_code} {response.text}")
     ret = response.json()
@@ -365,7 +315,6 @@ def hf_get_logprobs(
     attn_implementation: str,
     dtype: str,
     use_batch_invariant: bool,
-    hf_hook_debug: bool,
 ) -> torch.Tensor:
     if use_batch_invariant:
         try:
@@ -376,33 +325,53 @@ def hf_get_logprobs(
 
     from transformers import AttentionInterface, AutoModelForCausalLM
 
+    effective_attn_implementation = attn_implementation
+    miles_triton_patcher = None
     if attn_implementation == "triton":
-        attention_dir = Path(__file__).resolve().parent.parent / "attention_test"
-        if str(attention_dir) not in sys.path:
-            sys.path.insert(0, str(attention_dir))
-        from hf_triton_attention import triton_attention_forward
+        # Strong mode: only miles SGLang bridge patch is allowed.
+        try:
+            repo_root = Path(__file__).resolve().parents[2]
+            # Import bridge package directly from fsdp_utils to avoid
+            # triggering miles.backends.fsdp_utils.__init__ (which imports ray).
+            fsdp_utils_root = (
+                repo_root / "miles" / "miles" / "backends" / "fsdp_utils"
+            )
+            if str(fsdp_utils_root) not in sys.path:
+                sys.path.insert(0, str(fsdp_utils_root))
+            from sglang_attn_bridge.hf_sglang_triton_patch import (
+                apply_sglang_triton_attention_patch,
+            )
 
-        AttentionInterface.register("triton", triton_attention_forward)
-    try:
-        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
-    except Exception:
-        apply_rotary_pos_emb = None
-
-    debug_hf_hook = hf_hook_debug or _bool_env("HF_HOOK_DEBUG", False)
+            miles_triton_patcher = apply_sglang_triton_attention_patch
+            effective_attn_implementation = "eager"
+            print("[HF_DEBUG] day0 uses miles SGLang Triton bridge patch.")
+        except Exception as miles_patch_e:
+            raise RuntimeError(
+                "attn_implementation=triton requires miles SGLang bridge patch, "
+                f"but import/apply failed: {miles_patch_e!r}"
+            ) from miles_patch_e
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=resolve_torch_dtype(dtype),
         device_map="auto" if device == "cuda" else device,
         trust_remote_code=True,
-        attn_implementation=attn_implementation,
+        attn_implementation=effective_attn_implementation,
     )
     model.eval()
+    if miles_triton_patcher is not None:
+        try:
+            patched_layers = miles_triton_patcher(model)
+            print(f"[HF_DEBUG] miles bridge patched layers: {patched_layers}")
+        except Exception as patch_e:
+            print(f"[HF_DEBUG] miles bridge patch failed: {patch_e!r}")
     ids = torch.tensor([token_ids], dtype=torch.long, device=model.device)
-    _maybe_dump("input_ids_for_compare", ids)
+    # _maybe_dump("input_ids_for_compare", ids)
+    input_embeds = None
     try:
-        emb = model.get_input_embeddings()(ids)
-        _maybe_dump("embedding_output", emb)
+        # Align with SGLang rl_on_policy path: feed FP32 embeddings into pre-attn path.
+        input_embeds = model.get_input_embeddings()(ids).float()
+        # _maybe_dump("embedding_output", input_embeds)
     except Exception:
         pass
 
@@ -417,100 +386,185 @@ def hf_get_logprobs(
     hook_handles = []
     layer0_positions = torch.arange(ids.shape[1], device=ids.device, dtype=torch.long).unsqueeze(0)
     _maybe_dump("layer0_positions", layer0_positions)
-    hook_debug_printed = False
-    layer0_raw_hf = None
-    layer0_after_input_layernorm = None
-    layer0_self_attn_input = None
-    hf_prepare_alias_logged = False
 
-    def _log_hf_dump_failure(stage: str, exc: Exception, **context: Any) -> None:
-        context_parts = []
-        for key, value in context.items():
-            context_parts.append(f"{key}={value}")
-        suffix = f" ({', '.join(context_parts)})" if context_parts else ""
-        print(f"[HF dump] {stage} failed: {type(exc).__name__}: {exc}{suffix}")
+    # Align HF compute dtype with SGLang:
+    # 1) Keep pre-attn norm/residual path in FP32.
+    # 2) Cast hidden_states to BF16 right before self_attn.
+    self_attn_to_layer_id: dict[int, int] = {}
+    o_proj_to_layer_id: dict[int, int] = {}
+    last_layer_id = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        try:
+            last_layer_id = len(model.model.layers) - 1
+        except Exception:
+            last_layer_id = None
 
-    def _log_prepare_tensor_meta(name: str, value: torch.Tensor | None) -> None:
-        if value is None:
-            print(f"[HF prepare] {name} unavailable")
-            return
-        print(
-            f"[HF prepare] {name} "
-            f"shape={tuple(value.shape)} dtype={value.dtype} device={value.device} "
-            f"stride={tuple(value.stride())} contiguous={value.is_contiguous()} "
-            f"storage_offset={value.storage_offset()}"
-        )
+    def _norm_pre_fp32(_module, args, kwargs):
+        if len(args) > 0 and isinstance(args[0], torch.Tensor):
+            new_args = (args[0].float(),) + tuple(args[1:])
+            return new_args, kwargs
+        return None
 
-    def _log_tensor_exact_compare(name: str, lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> None:
-        if lhs is None or rhs is None:
-            print(f"[HF prepare] {name} compare unavailable")
-            return
-        lhs_cmp = _hf_slice(lhs).detach().cpu().contiguous()
-        rhs_cmp = _hf_slice(rhs).detach().cpu().contiguous()
-        if lhs_cmp.shape != rhs_cmp.shape:
-            print(
-                f"[HF prepare] {name} shape_mismatch lhs_shape={tuple(lhs_cmp.shape)} rhs_shape={tuple(rhs_cmp.shape)}"
-            )
-            return
-        bitwise_equal = lhs_cmp.dtype == rhs_cmp.dtype and torch.equal(lhs_cmp, rhs_cmp)
-        flat_lhs = lhs_cmp.reshape(-1)
-        flat_rhs = rhs_cmp.reshape(-1)
-        neq = torch.nonzero(flat_lhs != flat_rhs, as_tuple=False).reshape(-1)
-        diff_count = int(neq.numel())
-        if diff_count == 0:
-            print(f"[HF prepare] {name} bitwise_equal={bitwise_equal} differing_elements=0")
-            return
-        first_idx = int(neq[0].item())
-        print(
-            f"[HF prepare] {name} bitwise_equal={bitwise_equal} differing_elements={diff_count} "
-            f"first_mismatch_flat_index={first_idx} lhs={flat_lhs[first_idx].item()} rhs={flat_rhs[first_idx].item()}"
-        )
+    def _norm_post_fp32(_module, args, kwargs, output):
+        if isinstance(output, torch.Tensor):
+            return output.float()
+        return output
 
-    def _debug_print_hf_hook_state(
-        source: str,
-        position_embeddings: Any,
-        qn: torch.Tensor | None = None,
-        kn: torch.Tensor | None = None,
-    ) -> None:
-        nonlocal hook_debug_printed
-        if hook_debug_printed or not debug_hf_hook:
-            return
-        hook_debug_printed = True
-        msg = [f"[HF dump] position_embeddings source={source}"]
-        if position_embeddings is None:
-            msg.append("type=None")
-        else:
-            msg.append(f"type={type(position_embeddings).__name__}")
+    def _self_attn_pre_bf16(_module, args, kwargs):
+        hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+        if hs is None or not isinstance(hs, torch.Tensor):
+            return None
+        # Capture "after prepare_attn, before self_attn bf16 cast" for probe layers.
+        try:
+            layer_id = self_attn_to_layer_id.get(id(_module))
+            if layer_id in _HF_LAYER_PROBE_IDS:
+                _maybe_dump(f"layer{layer_id}_attn_input_after_prepare", _hf_slice(hs))
+        except Exception:
+            pass
+        hs = hs.to(torch.bfloat16)
+        if "hidden_states" in kwargs:
+            new_kwargs = dict(kwargs)
+            new_kwargs["hidden_states"] = hs
+            return args, new_kwargs
+        new_args = list(args)
+        new_args[0] = hs
+        return tuple(new_args), kwargs
+
+    def _mlp_pre_bf16(_module, args, kwargs):
+        x = kwargs.get("hidden_states", kwargs.get("x", args[0] if len(args) > 0 else None))
+        if x is None or not isinstance(x, torch.Tensor):
+            return None
+        x = x.to(torch.bfloat16)
+        if "hidden_states" in kwargs:
+            new_kwargs = dict(kwargs)
+            new_kwargs["hidden_states"] = x
+            return args, new_kwargs
+        if "x" in kwargs:
+            new_kwargs = dict(kwargs)
+            new_kwargs["x"] = x
+            return args, new_kwargs
+        new_args = list(args)
+        new_args[0] = x
+        return tuple(new_args), kwargs
+
+    def _o_proj_pre_cast(_module, args, kwargs):
+        if len(args) == 0 or not isinstance(args[0], torch.Tensor):
+            return None
+        x = args[0]
+        try:
+            layer_id = o_proj_to_layer_id.get(id(_module))
+            if layer_id == 0:
+                _maybe_dump("layer0_attn_context_before_o_proj", _hf_slice(x))
+            if last_layer_id is not None and layer_id == last_layer_id:
+                _maybe_dump("attn_context_before_o_proj", _hf_slice(x))
+        except Exception:
+            pass
+        target_dtype = _module.weight.dtype
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
+        return (x,) + tuple(args[1:]), kwargs
+
+    def _lm_head_pre_cast(_module, args, kwargs):
+        if len(args) == 0 or not isinstance(args[0], torch.Tensor):
+            return None
+        x = args[0]
+        target_dtype = _module.weight.dtype
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
+        return (x,) + tuple(args[1:]), kwargs
+
+    def _make_mlp_output_hook(layer_id: int):
+        def _capture_mlp_output(_module, args, kwargs, output):
             try:
-                msg.append(f"len={len(position_embeddings)}")
+                hidden_component = output[0] if isinstance(output, tuple) else output
+                if isinstance(hidden_component, torch.Tensor):
+                    if layer_id == 0:
+                        _maybe_dump(
+                            "layer0_mlp_output",
+                            _hf_slice(hidden_component.to(torch.bfloat16)),
+                        )
+                    _maybe_dump(
+                        f"layer{layer_id}_hidden_component_after_postprocess",
+                        _hf_slice(hidden_component.to(torch.bfloat16)),
+                    )
             except Exception:
-                msg.append("len=<unavailable>")
-        if qn is not None:
-            msg.append(f"qn.shape={tuple(qn.shape)}")
-            msg.append(f"qn.dtype={qn.dtype}")
-        if kn is not None:
-            msg.append(f"kn.shape={tuple(kn.shape)}")
-            msg.append(f"kn.dtype={kn.dtype}")
-        if isinstance(position_embeddings, tuple) and len(position_embeddings) == 2:
-            cos, sin = position_embeddings
-            if hasattr(cos, "shape"):
-                msg.append(f"cos.shape={tuple(cos.shape)}")
-            if hasattr(sin, "shape"):
-                msg.append(f"sin.shape={tuple(sin.shape)}")
-        print(", ".join(msg))
+                pass
+
+        return _capture_mlp_output
+
+    def _make_layer_output_hook(layer_id: int):
+        def _capture_layer_output(_module, args, kwargs, output):
+            try:
+                decoder_output = output[0] if isinstance(output, tuple) else output
+                if isinstance(decoder_output, torch.Tensor):
+                    _maybe_dump(
+                        f"layer{layer_id}_decoder_output_full",
+                        _hf_slice(decoder_output.float()),
+                    )
+            except Exception:
+                pass
+
+        return _capture_layer_output
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer_id, layer in enumerate(model.model.layers):
+            for norm_name in ("input_layernorm", "post_attention_layernorm"):
+                norm_mod = getattr(layer, norm_name, None)
+                if norm_mod is not None:
+                    hook_handles.append(
+                        norm_mod.register_forward_pre_hook(_norm_pre_fp32, with_kwargs=True)
+                    )
+                    hook_handles.append(
+                        norm_mod.register_forward_hook(_norm_post_fp32, with_kwargs=True)
+                    )
+            if hasattr(layer, "self_attn"):
+                self_attn_to_layer_id[id(layer.self_attn)] = layer_id
+                hook_handles.append(
+                    layer.self_attn.register_forward_pre_hook(
+                        _self_attn_pre_bf16, with_kwargs=True
+                    )
+                )
+                if hasattr(layer.self_attn, "o_proj"):
+                    o_proj_to_layer_id[id(layer.self_attn.o_proj)] = layer_id
+                    hook_handles.append(
+                        layer.self_attn.o_proj.register_forward_pre_hook(
+                            _o_proj_pre_cast, with_kwargs=True
+                        )
+                    )
+            if hasattr(layer, "mlp"):
+                hook_handles.append(
+                    layer.mlp.register_forward_pre_hook(
+                        _mlp_pre_bf16, with_kwargs=True
+                    )
+                )
+                if layer_id in _HF_LAYER_PROBE_IDS:
+                    hook_handles.append(
+                        layer.mlp.register_forward_hook(
+                            _make_mlp_output_hook(layer_id), with_kwargs=True
+                        )
+                    )
+            if layer_id in _HF_LAYER_PROBE_IDS:
+                hook_handles.append(
+                    layer.register_forward_hook(
+                        _make_layer_output_hook(layer_id), with_kwargs=True
+                    )
+                )
+        if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+            hook_handles.append(
+                model.lm_head.register_forward_pre_hook(
+                    _lm_head_pre_cast, with_kwargs=True
+                )
+            )
 
     # Layer-0 pre-attention probes.
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
         first_layer = model.model.layers[0]
 
         def _capture_layer0_raw(_module, args, kwargs):
-            nonlocal layer0_raw_hf
             try:
                 hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
                 if hs is not None:
-                    layer0_raw_hf = hs
                     _maybe_dump("layer0_attn_input_raw", _hf_slice(hs))
-                    _log_prepare_tensor_meta("layer0_attn_input_raw", _hf_slice(hs))
             except Exception:
                 pass
 
@@ -518,59 +572,178 @@ def hf_get_logprobs(
             first_layer.register_forward_pre_hook(_capture_layer0_raw, with_kwargs=True)
         )
 
-        if hasattr(first_layer, "input_layernorm"):
-            def _capture_layer0_after_input_layernorm(_module, args, kwargs, output):
-                del args, kwargs
-                nonlocal layer0_after_input_layernorm
-                try:
-                    hs = output[0] if isinstance(output, tuple) else output
-                    if hs is not None:
-                        layer0_after_input_layernorm = hs
-                        _maybe_dump("layer0_after_input_layernorm", _hf_slice(hs))
-                        _log_prepare_tensor_meta("layer0_after_input_layernorm", _hf_slice(hs))
-                except Exception as exc:
-                    _log_hf_dump_failure("layer0_after_input_layernorm", exc)
+        # layer0_attn_input_after_prepare is captured inside _self_attn_pre_bf16
+        # before bf16 cast, to match SGLang's semantic timing.
+        def _capture_layer0_after_attn_residual_add(_module, args, kwargs):
+            try:
+                hs = args[0] if len(args) > 0 else kwargs.get("hidden_states", None)
+                if isinstance(hs, torch.Tensor):
+                    _maybe_dump("layer0_after_attn_residual_add", _hf_slice(hs))
+            except Exception:
+                pass
 
+        def _capture_layer0_post_attn_ln_output(_module, args, kwargs, output):
+            try:
+                out = output[0] if isinstance(output, tuple) else output
+                if isinstance(out, torch.Tensor):
+                    _maybe_dump("layer0_post_attention_layernorm_output", _hf_slice(out))
+            except Exception:
+                pass
+
+        if hasattr(first_layer, "post_attention_layernorm"):
             hook_handles.append(
-                first_layer.input_layernorm.register_forward_hook(
-                    _capture_layer0_after_input_layernorm, with_kwargs=True
+                first_layer.post_attention_layernorm.register_forward_pre_hook(
+                    _capture_layer0_after_attn_residual_add, with_kwargs=True
+                )
+            )
+            hook_handles.append(
+                first_layer.post_attention_layernorm.register_forward_hook(
+                    _capture_layer0_post_attn_ln_output, with_kwargs=True
                 )
             )
 
-        if hasattr(first_layer, "self_attn"):
-            def _capture_layer0_after_prepare(_module, args, kwargs, output):
-                del output
-                nonlocal layer0_self_attn_input, hf_prepare_alias_logged
-                try:
-                    hs = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
-                    if hs is not None:
-                        layer0_self_attn_input = hs
-                        _maybe_dump("layer0_self_attn_input", _hf_slice(hs))
-                        _maybe_dump("layer0_attn_input_after_prepare", _hf_slice(hs))
-                        if not hf_prepare_alias_logged:
-                            print(
-                                "[HF prepare] layer0_attn_input_after_prepare is a compatibility alias "
-                                "for layer0_self_attn_input; in HF this is self_attn hidden_states "
-                                "after decoder input_layernorm, not a true SGLang prepare_attn output"
-                            )
-                            hf_prepare_alias_logged = True
-                        _log_prepare_tensor_meta("layer0_self_attn_input", _hf_slice(hs))
-                        _log_tensor_exact_compare(
-                            "layer0_raw_vs_layer0_self_attn_input",
-                            layer0_raw_hf,
-                            layer0_self_attn_input,
-                        )
-                        _log_tensor_exact_compare(
-                            "layer0_after_input_layernorm_vs_layer0_self_attn_input",
-                            layer0_after_input_layernorm,
-                            layer0_self_attn_input,
-                        )
-                except Exception:
-                    pass
+        def _capture_layer0_attn_output(_module, args, kwargs, output):
+            try:
+                attn_out = output[0] if isinstance(output, tuple) else output
+                if isinstance(attn_out, torch.Tensor):
+                    _maybe_dump("layer0_attn_out_after_o_proj", _hf_slice(attn_out))
 
+                hidden_states = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+                if hidden_states is None or not isinstance(hidden_states, torch.Tensor):
+                    return
+
+                if hasattr(_module, "q_proj") and hasattr(_module, "k_proj") and hasattr(_module, "v_proj"):
+                    q = _module.q_proj(hidden_states)
+                    k = _module.k_proj(hidden_states)
+                    v = _module.v_proj(hidden_states)
+                    _maybe_dump("layer0_q_pre_norm", _hf_slice(q))
+                    _maybe_dump("layer0_k_pre_norm", _hf_slice(k))
+                    _maybe_dump("layer0_v_pre_norm", _hf_slice(v))
+
+                    qn, kn = q, k
+                    if hasattr(_module, "q_norm") and hasattr(_module, "k_norm"):
+                        try:
+                            # Align with local HF / verify: norm on float32 input -> float32 output,
+                            # so HF_dump matches norm(float32(pre_norm)) instead of float32(norm(bf16)).
+                            head_dim = getattr(_module, "head_dim", None)
+                            if head_dim is None and hasattr(_module, "q_norm") and hasattr(_module.q_norm, "weight"):
+                                head_dim = int(_module.q_norm.weight.numel())
+                            if head_dim is not None and head_dim > 0:
+                                q_fp = q.float()
+                                k_fp = k.float()
+                                qn = _module.q_norm(q_fp.reshape(-1, head_dim)).view_as(q_fp)
+                                kn = _module.k_norm(k_fp.reshape(-1, head_dim)).view_as(k_fp)
+                                _maybe_dump("layer0_q_post_norm", _hf_slice(qn))
+                                _maybe_dump("layer0_k_post_norm", _hf_slice(kn))
+                            else:
+                                print(
+                                    "[HF_DEBUG] skip layer0_q/k_post_norm: "
+                                    f"head_dim={head_dim}"
+                                )
+                        except Exception as norm_e:
+                            print(f"[HF_DEBUG] layer0_q/k_post_norm failed: {norm_e!r}")
+                    else:
+                        print("[HF_DEBUG] skip layer0_q/k_post_norm: q_norm/k_norm missing")
+
+                    # Best-effort rope reconstruction for layer0:
+                    # prefer explicit position_embeddings; fallback to module rotary_emb + position_ids.
+                    rope_done = False
+                    try:
+                        head_dim = getattr(_module, "head_dim", None)
+                        if head_dim is None and hasattr(_module, "q_norm") and hasattr(_module.q_norm, "weight"):
+                            head_dim = int(_module.q_norm.weight.numel())
+                        num_heads = getattr(_module, "num_heads", None)
+                        if num_heads is None and head_dim:
+                            num_heads = qn.shape[-1] // head_dim
+                        num_kv_heads = getattr(_module, "num_key_value_heads", None)
+                        if num_kv_heads is None:
+                            num_kv_heads = getattr(_module, "num_kv_heads", None)
+                        if num_kv_heads is None and head_dim:
+                            num_kv_heads = kn.shape[-1] // head_dim
+                        if (
+                            num_heads is not None
+                            and num_kv_heads is not None
+                            and head_dim is not None
+                        ):
+                            qh = qn.view(qn.shape[0], qn.shape[1], num_heads, head_dim).transpose(1, 2)
+                            kh = kn.view(kn.shape[0], kn.shape[1], num_kv_heads, head_dim).transpose(1, 2)
+
+                            cos = sin = None
+                            position_embeddings = kwargs.get("position_embeddings", None)
+                            if position_embeddings is None:
+                                for a in args:
+                                    if (
+                                        isinstance(a, (tuple, list))
+                                        and len(a) >= 2
+                                        and torch.is_tensor(a[0])
+                                        and torch.is_tensor(a[1])
+                                    ):
+                                        position_embeddings = a
+                                        break
+                            if (
+                                isinstance(position_embeddings, (tuple, list))
+                                and len(position_embeddings) >= 2
+                            ):
+                                cos, sin = position_embeddings[0], position_embeddings[1]
+                            else:
+                                position_ids = kwargs.get("position_ids", None)
+                                if position_ids is None:
+                                    for a in args:
+                                        if (
+                                            torch.is_tensor(a)
+                                            and a.dtype in (torch.int64, torch.int32)
+                                            and a.ndim in (1, 2)
+                                        ):
+                                            position_ids = a
+                                            break
+                                rotary_emb = getattr(_module, "rotary_emb", None)
+                                if rotary_emb is not None and position_ids is not None:
+                                    try:
+                                        cos, sin = rotary_emb(qh, position_ids)
+                                    except Exception as rope_cache_e:
+                                        print(
+                                            f"[HF_DEBUG] layer0 rope cache build failed: {rope_cache_e!r}"
+                                        )
+
+                            if cos is not None and sin is not None:
+                                apply_rotary_pos_emb = None
+                                try:
+                                    from transformers.models.qwen3.modeling_qwen3 import (
+                                        apply_rotary_pos_emb as _apply_rotary_pos_emb,
+                                    )
+
+                                    apply_rotary_pos_emb = _apply_rotary_pos_emb
+                                except Exception:
+                                    try:
+                                        from transformers.models.qwen2.modeling_qwen2 import (
+                                            apply_rotary_pos_emb as _apply_rotary_pos_emb,
+                                        )
+
+                                        apply_rotary_pos_emb = _apply_rotary_pos_emb
+                                    except Exception as import_e:
+                                        print(
+                                            f"[HF_DEBUG] cannot import apply_rotary_pos_emb: {import_e!r}"
+                                        )
+
+                                if apply_rotary_pos_emb is not None:
+                                    qh2, kh2 = apply_rotary_pos_emb(qh, kh, cos, sin)
+                                    q_rope = qh2.transpose(1, 2).reshape_as(qn)
+                                    k_rope = kh2.transpose(1, 2).reshape_as(kn)
+                                    _maybe_dump("layer0_q_post_rope", _hf_slice(q_rope))
+                                    _maybe_dump("layer0_k_post_rope", _hf_slice(k_rope))
+                                    rope_done = True
+                    except Exception as rope_e:
+                        print(f"[HF_DEBUG] layer0_q/k_post_rope failed: {rope_e!r}")
+
+                    if not rope_done:
+                        print("[HF_DEBUG] skip layer0_q/k_post_rope: rope inputs unavailable")
+            except Exception as capture_e:
+                print(f"[HF_DEBUG] _capture_layer0_attn_output failed: {capture_e!r}")
+
+        if hasattr(first_layer, "self_attn"):
             hook_handles.append(
                 first_layer.self_attn.register_forward_hook(
-                    _capture_layer0_after_prepare, with_kwargs=True
+                    _capture_layer0_attn_output, with_kwargs=True
                 )
             )
 
@@ -580,15 +753,12 @@ def hf_get_logprobs(
             def _capture_last_attn_output(_module, args, kwargs, output):
                 nonlocal attn_out_last_layer
                 attn_out_last_layer = output[0] if isinstance(output, tuple) else output
-                hidden_states = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
-                if hidden_states is None:
-                    print("[HF dump] attn_input_last_layer unavailable: hidden_states missing")
-                    return
-
-                _maybe_dump("attn_input_last_layer", _hf_slice(hidden_states))
-
-                q = k = v = None
                 try:
+                    hidden_states = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+                    if hidden_states is None:
+                        return
+                    _maybe_dump("attn_input_last_layer", _hf_slice(hidden_states))
+
                     if hasattr(_module, "q_proj") and hasattr(_module, "k_proj") and hasattr(_module, "v_proj"):
                         q = _module.q_proj(hidden_states)
                         k = _module.k_proj(hidden_states)
@@ -596,97 +766,26 @@ def hf_get_logprobs(
                         _maybe_dump("q_pre_norm", _hf_slice(q))
                         _maybe_dump("k_pre_norm", _hf_slice(k))
                         _maybe_dump("v_pre_norm", _hf_slice(v))
-                except Exception as exc:
-                    _log_hf_dump_failure(
-                        "q_pre_norm/k_pre_norm/v_pre_norm",
-                        exc,
-                        hidden_states_shape=tuple(hidden_states.shape),
-                        hidden_states_dtype=hidden_states.dtype,
-                    )
 
-                qn = kn = None
-                qn_dump = kn_dump = None
-                if q is not None and k is not None:
-                    try:
-                        if not (hasattr(_module, "q_norm") and hasattr(_module, "k_norm")):
-                            raise RuntimeError("module missing q_norm/k_norm")
-                        input_shape = hidden_states.shape[:-1]
-                        head_dim = getattr(_module, "head_dim", None)
-                        if head_dim is None:
-                            raise RuntimeError(
-                                f"missing metadata: head_dim={head_dim}"
-                            )
-                        if q.shape[-1] % head_dim != 0 or k.shape[-1] % head_dim != 0:
-                            raise RuntimeError(
-                                f"invalid q/k shape for head_dim={head_dim}: q.shape={tuple(q.shape)}, k.shape={tuple(k.shape)}"
-                            )
-                        num_heads = q.shape[-1] // head_dim
-                        num_kv_heads = k.shape[-1] // head_dim
-                        q_hidden_shape = (*input_shape, num_heads, head_dim)
-                        k_hidden_shape = (*input_shape, num_kv_heads, head_dim)
-                        qn = _module.q_norm(q.view(q_hidden_shape)).transpose(1, 2)
-                        kn = _module.k_norm(k.view(k_hidden_shape)).transpose(1, 2)
-                        qn_dump = qn.transpose(1, 2).reshape_as(q)
-                        kn_dump = kn.transpose(1, 2).reshape_as(k)
-                        _maybe_dump("q_post_norm", _hf_slice(qn_dump))
-                        _maybe_dump("k_post_norm", _hf_slice(kn_dump))
-                    except Exception as exc:
-                        _log_hf_dump_failure(
-                            "q_post_norm/k_post_norm",
-                            exc,
-                            q_shape=tuple(q.shape),
-                            k_shape=tuple(k.shape),
-                            q_dtype=q.dtype,
-                            k_dtype=k.dtype,
-                        )
+                        qn, kn = q, k
+                        if hasattr(_module, "q_norm") and hasattr(_module, "k_norm"):
+                            num_heads = getattr(_module, "num_heads", None)
+                            num_kv_heads = getattr(_module, "num_key_value_heads", num_heads)
+                            if num_heads is not None and num_kv_heads is not None:
+                                q_head_dim = q.shape[-1] // num_heads
+                                k_head_dim = k.shape[-1] // num_kv_heads
+                                # Norm on float32 input -> float32 output, so HF_dump matches local HF.
+                                q_fp = q.float()
+                                k_fp = k.float()
+                                qn = _module.q_norm(q_fp.view(q_fp.shape[0], q_fp.shape[1], num_heads, q_head_dim)).reshape_as(q_fp)
+                                kn = _module.k_norm(k_fp.view(k_fp.shape[0], k_fp.shape[1], num_kv_heads, k_head_dim)).reshape_as(k_fp)
+                                _maybe_dump("q_post_norm", _hf_slice(qn))
+                                _maybe_dump("k_post_norm", _hf_slice(kn))
 
-                if qn is not None and kn is not None:
-                    position_embeddings = None
-                    position_source = "missing"
-                    if "position_embeddings" in kwargs:
-                        position_embeddings = kwargs["position_embeddings"]
-                        position_source = "kwargs"
-                    elif len(args) > 1:
-                        position_embeddings = args[1]
-                        position_source = "args[1]"
-                    _debug_print_hf_hook_state(position_source, position_embeddings, qn, kn)
-                    try:
-                        if apply_rotary_pos_emb is None:
-                            raise RuntimeError("apply_rotary_pos_emb unavailable")
-                        if position_embeddings is None:
-                            raise RuntimeError("position_embeddings unavailable")
-                        if not isinstance(position_embeddings, tuple) or len(position_embeddings) != 2:
-                            raise RuntimeError(
-                                f"position_embeddings must be tuple(len=2), got {type(position_embeddings).__name__}"
-                            )
-                        cos, sin = position_embeddings
-                        q_rope, k_rope = apply_rotary_pos_emb(qn, kn, cos, sin)
-                        q_rope_dump = q_rope.transpose(1, 2).reshape_as(q)
-                        k_rope_dump = k_rope.transpose(1, 2).reshape_as(k)
-                        _maybe_dump("q_post_rope", _hf_slice(q_rope_dump))
-                        _maybe_dump("k_post_rope", _hf_slice(k_rope_dump))
-                    except Exception as exc:
-                        rope_context = {
-                            "position_source": position_source,
-                            "position_type": type(position_embeddings).__name__ if position_embeddings is not None else None,
-                            "qn_shape": tuple(qn.shape),
-                            "kn_shape": tuple(kn.shape),
-                        }
-                        if isinstance(position_embeddings, tuple) and len(position_embeddings) == 2:
-                            cos, sin = position_embeddings
-                            rope_context["cos_shape"] = tuple(cos.shape)
-                            rope_context["sin_shape"] = tuple(sin.shape)
-                        _log_hf_dump_failure("q_post_rope/k_post_rope", exc, **rope_context)
-
-                try:
-                    if attn_out_last_layer is not None:
-                        _maybe_dump("attn_context_before_o_proj", _hf_slice(attn_out_last_layer))
-                except Exception as exc:
-                    _log_hf_dump_failure(
-                        "attn_context_before_o_proj",
-                        exc,
-                        attn_out_shape=tuple(attn_out_last_layer.shape) if hasattr(attn_out_last_layer, "shape") else None,
-                    )
+                    # Last-layer attn_context_before_o_proj is captured from o_proj pre-hook
+                    # to match SGLang's "context before o_proj" semantic.
+                except Exception:
+                    pass
 
             hook_handles.append(
                 last_layer.self_attn.register_forward_hook(
@@ -695,7 +794,15 @@ def hf_get_logprobs(
             )
 
     with torch.no_grad():
-        outputs = model(ids, output_hidden_states=True, return_dict=True)
+        if input_embeds is not None:
+            outputs = model(
+                input_ids=None,
+                inputs_embeds=input_embeds,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        else:
+            outputs = model(ids, output_hidden_states=True, return_dict=True)
         logits = outputs.logits
         final_hidden_before_lm_head = outputs.hidden_states[-1]
         if attn_out_last_layer is not None:
@@ -778,7 +885,6 @@ def main() -> None:
         attn_implementation=args.attn_implementation,
         dtype=args.dtype,
         use_batch_invariant=args.use_batch_invariant,
-        hf_hook_debug=args.hf_hook_debug,
     )
     n_gen = len(gen_token_ids)
     hf_slice = hf_logprobs_full[0, prompt_len - 1 : prompt_len - 1 + n_gen]
