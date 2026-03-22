@@ -128,6 +128,52 @@ def _sglang_triton_attention(query, key, value, ...):
 
 关键点在于使用 **per-request indptrs**——每条序列独立计算，不受 batch composition 影响，从根本上保证了 batch invariance。
 
+### 训练侧：Triton Backward Kernel
+
+Forward 用 SGLang 的 Triton kernel 保证了推理-训练对齐，但训练还需要 backward——梯度必须正确回传到 Q/K/V projection，否则模型无法学习。我们通过 `torch.autograd.Function` 将 forward 和 backward 封装为一个完整的 autograd 节点：
+
+```python
+class TritonAttnFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, B, S):
+        # Forward: 调用 SGLang extend_attention_fwd_unified（与推理 bitwise 一致）
+        extend_attention_fwd_unified(q, o, k, v, qo_indptr, kv_indptr, ...)
+        ctx.save_for_backward(q, k, v, o)
+        return o
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Backward: Triton memory-efficient backward（不物化 S×S attention matrix）
+        dq, dk, dv = triton_attention_backward(q, k, v, o, grad_output, B, S)
+        return dq, dk, dv, None, None
+```
+
+Backward 的核心挑战在于：**forward kernel 没有保存 LSE（log-sum-exp）**。标准 Flash Attention backward 依赖 forward 保存的 LSE 来重算 softmax 权重 $P_{ij} = \exp(q_i k_j^T \cdot \text{scale} - \text{LSE}_i)$，但 `extend_attention_fwd_unified` 是推理 kernel，不输出 LSE。
+
+我们的解决方案是在 backward 中**额外计算一遍 LSE**，整个 backward 分四步：
+
+**Step 1：`_bwd_preprocess`** —— 计算 $\delta_i = \sum_d O_i \cdot dO_i$（每个 query position 的 dot product，用于后续 dS 计算）
+
+**Step 2：`_compute_lse`** —— 用 online accumulation 重新扫描所有 K block，计算全局 LSE：
+
+$$\text{LSE}_i = \log \sum_{j \leq i} \exp(q_i k_j^T \cdot \text{scale})$$
+
+这一步是整个 backward 的关键。最初的实现在每个 block 内独立算 softmax（per-block normalization），当序列长度 S > BLOCK_N（64）时，softmax 归一化不是全局的，导致 $P_{ij}$ 计算错误，梯度爆炸（`grad_norm=inf`）。加入 `_compute_lse` kernel 做全局 log-sum-exp 后问题解决。
+
+**Step 3：`_bwd_kernel_dk_dv`** —— 计算 dK 和 dV。每个 program 拥有一个 K/V block，遍历所有 Q block 累积梯度：
+
+$$dV = P^T \cdot dO, \quad dK = dS^T \cdot Q$$
+
+其中 $dS = P \odot (dO \cdot V^T - \delta) \cdot \text{scale}$，$P$ 通过 LSE 重算：$P = \exp(QK^T \cdot \text{scale} - \text{LSE})$。
+
+**Step 4：`_bwd_kernel_dq`** —— 计算 dQ。每个 program 拥有一个 Q block，遍历所有 K/V block 累积梯度：
+
+$$dQ = dS \cdot K$$
+
+这种 two-pass 设计（dK/dV 一遍，dQ 一遍）避免了 atomic 操作，每个 program 在寄存器中完成累积后一次性写回。对于 GQA，backward 先将 K/V expand 到 `num_heads` 维度计算梯度，最后沿 group 维度 sum 回 `num_kv_heads`。
+
+整个 backward 的显存开销为 $O(S)$（存 LSE 和 delta），不需要物化 $S \times S$ 的 attention matrix。
+
 ## 逐层对齐：七层地狱
 
 统一 attention kernel 只是第一步。推理和训练之间，从 embedding 到 logits 的每一步都可能引入数值差异。我们建立了系统性的逐层 tensor dump 框架，按照 **norm → RoPE → attention → residual → MLP → logits** 的顺序逐一排查并修复。
