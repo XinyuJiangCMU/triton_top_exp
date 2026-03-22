@@ -12,13 +12,15 @@ RL & LLM @ SGLang & Slime
 
 On-Policy RL 训练中，有一个容易被忽略但至关重要的问题：**推理引擎（SGLang）生成 rollout 时计算的 log probability，和训练引擎（FSDP/Megatron）forward 时重新计算的 log probability，是否严格一致？**
 
-在标准流程中，这两者之间总存在微小的数值差异——不同的 attention kernel、不同的 batch size、不同的浮点累积顺序，都会引入 $O(10^{-4})$ 量级的漂移。这看似无关紧要，但在 GRPO 等算法中，importance ratio $\frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}$ 的计算直接依赖于这个 log probability，微小的数值差异会在训练过程中被放大，导致策略梯度估计引入不必要的噪声。
+在标准流程中，这两者之间总存在微小的数值差异——不同的 attention kernel、不同的 batch size、不同的浮点累积顺序，都会引入 $O(10^{-4})$ 量级的漂移。这看似无关紧要，但在 GRPO 等算法中会造成实质性的影响。
+
+具体来说，GRPO 的策略梯度依赖 importance ratio $r(\theta) = \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}$。在 On-Policy 场景下，rollout 是由当前策略 $\pi_\theta$ 自身生成的，因此 $\pi_\theta = \pi_{\text{old}}$，理论上 $r(\theta) = 1$，对应 log ratio $\log \pi_\theta - \log \pi_{\text{old}} = 0$。然而，如果推理引擎计算的 $\log \pi_{\text{old}}$ 和训练引擎重新计算的 $\log \pi_\theta$ 之间存在数值差异 $\epsilon$，那么 log ratio 就不再是 0，而是 $\epsilon$。这个 $\epsilon$ 会直接进入梯度估计——GRPO 使用 clipped surrogate objective $\min(r(\theta) \hat{A}, \text{clip}(r(\theta), 1-\epsilon_c, 1+\epsilon_c) \hat{A})$，当 $r(\theta) \neq 1$ 时，clip 机制可能被错误触发或错误绕过，导致策略更新方向偏离真实梯度。更严重的是，这种偏差是系统性的——它不会随着样本增多而被平均掉，而是在每一步训练中都持续引入噪声，最终累积为不可忽略的训练不稳定性。
 
 True On-Policy 的目标很直接：**让推理和训练的 log probability 完全一致，diff = 0，bitwise equal。** 在 NVIDIA GPU 上，这已经通过 Flash Attention 3 + DeepGEMM + batch invariant ops 实现了。但在 AMD GPU 上——没有 FA3，没有 DeepGEMM，一切要从 Triton 开始重建。
 
 **这就是本文解决的问题——我们在 AMD/ROCm 上基于 Triton backend 实现了完整的 True On-Policy 支持，最终达到了 `train_rollout_logprob_abs_diff = 0.0`。**
 
-目前已经合入 slime 主干，一键使用，参考[文档](https://github.com/THUDM/slime)。
+目前已向 SGLang 和 Miles 提交 PR，正在 review 中。
 
 ## 前置知识：NVIDIA 上的 True On-Policy 是怎么做的
 
@@ -40,11 +42,11 @@ NVIDIA 版本的 True On-Policy 建立在三大基石之上。
 
 理解了 NVIDIA 版本的方案后，就能看清 AMD 上的困难所在——上述三大基石在 AMD/ROCm 上全部失效。
 
-**没有 FA3**。AMD 上没有 Flash Attention 3，Triton backend 是主要的 attention 实现。而 SGLang 的 Triton backend 在推理时 decode 和 extend 走的是完全不同的 kernel：decode 走 `decode_attention_fwd()`（paged attention），extend 走 `extend_attention_fwd()`（2-stage kernel）。训练侧（FSDP）默认使用 HuggingFace 的 `flash_attention_2`——这是第三个完全不同的实现。三方用三个不同的 kernel，天然不对齐。
+**没有 FA3**。AMD 上没有 Flash Attention 3。虽然 AMD 有自己的高性能算子库 AITER，但 AITER 目前不支持确定性推理，无法保证相同输入产生 bitwise 相同的输出。因此，在 SGLang 的 AMD 支持中，目前唯一能用于确定性推理的 attention backend 就是 Triton。而 SGLang 的 Triton backend 在推理时 decode 和 extend 走的是完全不同的 kernel：decode 走 `decode_attention_fwd()`（paged attention），extend 走 `extend_attention_fwd()`（2-stage kernel）。训练侧（FSDP）默认使用 HuggingFace 的 `flash_attention_2`——这是第三个完全不同的实现。三方用三个不同的 kernel，天然不对齐。
 
 **没有 DeepGEMM**。DeepGEMM 依赖 NVIDIA 的 CUTLASS 和 tensor core，在 AMD 上无法运行，矩阵乘法的确定性需要另寻出路。
 
-**Batch Invariant Ops 覆盖不全**。最隐蔽的问题是：AMD 上的 RMSNorm 实现有 `forward_aiter()` 和 `forward_hip()` 两条 ROCm 特有的加速路径，这些路径绕过了 CUDA 版 `batch_invariant_ops` 的 monkey patch，导致即使开启了 batch invariant mode，实际执行的仍然是非确定性的 kernel。此外，`torch.compile` 在 ROCm 上对 RoPE 的编译结果也会引入 nondeterminism，进一步增加了对齐难度。
+**Batch Invariant Ops 覆盖不全**。`batch_invariant_ops` 的 monkey patch 只覆盖了 CUDA 路径（`forward_cuda()`），但 AMD 上 RMSNorm 实际走的是 `forward_aiter()` 或 `forward_hip()`——patch 根本没生效。
 
 **简而言之，NVIDIA 上已经铺好的路，在 AMD 上全部要从零开始用 Triton 重建。**
 
@@ -76,6 +78,23 @@ def forward_decode(self, q, k, v, layer_id, ...):
 ```
 
 **训练侧 FSDP**：我们实现了一个 HuggingFace attention bridge，将 `extend_attention_fwd_unified` 注册为 HF 的自定义 attention backend（替代原来的 `flash_attention_2`）。
+
+### Unified Decode 的性能代价
+
+统一 kernel 带来了对齐，但 decode 阶段会有性能损失。原因在于两个 kernel 的并行策略完全不同：`decode_attention_fwd` 知道 Q 只有 1 个 token，因此将 KV cache 切成多份（Split-KV），由多个 thread block 并行扫描，最后 reduce 合并；而 `extend_attention_fwd_unified` 的并行维度是 Q 的分块数——decode 时 Q 只有 1 个 token，第三维 grid = 1，意味着一个 thread block 串行遍历全部 KV cache。
+
+我们在 H200 上实测了两个 kernel 的 decode 延迟（GQA，16 query heads / 8 kv heads，head_dim=64）：
+
+| seq_len | decode kernel | unified kernel | slowdown |
+|---------|--------------|----------------|----------|
+| 512     | 0.054 ms     | 0.037 ms       | 0.69x    |
+| 1024    | 0.053 ms     | 0.066 ms       | 1.25x    |
+| 4096    | 0.052 ms     | 0.248 ms       | 4.78x    |
+| 16384   | 0.055 ms     | 1.064 ms       | 19.2x    |
+
+短序列时 unified 反而略快——decode kernel 的 split + reduce 两阶段有固定开销，KV 量少时并行收益不够覆盖。但从 1k token 开始 unified 就明显变慢，且差距随序列长度线性增长：decode kernel 的耗时几乎不随 seq_len 变化（Split-KV 并行消化了增长），而 unified kernel 每翻倍 seq_len 耗时也翻倍。
+
+不过需要注意，decode attention 只是整个 decode step 的一部分（还有 Linear、LayerNorm、MLP 等），且 RL 训练中 decode 的总时间占比取决于序列长度和 batch 大小。实际的端到端性能影响需要在完整训练流程中评估。
 
 这样，**推理的 decode、推理的 extend、训练的 forward 三方统一到同一个 `extend_attention_fwd_unified` kernel，从根源消除差异。**
 
@@ -345,6 +364,16 @@ SGLANG_RETURN_ORIGINAL_LOGPROB=1             # 返回 pre-softmax logits
 2. **同一 kernel**：推理和训练使用完全相同的 `extend_attention_fwd_unified`，从根源消除差异
 3. **Batch Invariant**：per-request indptrs 确保计算与 batch composition 无关
 4. **精度控制**：在每一层精确控制 dtype（fp32 用于 accumulation，bf16 用于 compute），与训练侧严格对齐
+
+## 后续工作
+
+当前的实现已经在 AMD 上达成了 True On-Policy 的核心目标（logprob diff = 0），但仍有不少优化空间：
+
+- **AITER 确定性推理支持**：目前 AMD 上只能使用 Triton backend 做确定性推理，而 AITER 作为 AMD 原生的高性能算子库，在非确定性场景下性能显著优于 Triton。如果 AITER 后续支持确定性模式，将 True On-Policy 的 attention kernel 切换到 AITER 可以带来可观的推理加速。
+- **确定性推理性能优化**：当前的 unified decode path 将 decode 路由到 extend kernel，牺牲了 decode 阶段的专用优化（如 paged attention 的访存模式）。后续可以探索在保证确定性的前提下，针对 decode 场景优化 unified kernel 的性能。
+- **更多模型支持**：目前验证了 Qwen3-0.6B，后续需要扩展到更大规模的模型（Qwen3-4B、Qwen3-32B 等）以及 MoE 架构，验证在不同模型结构下的对齐效果和性能表现。
+- **DeepGEMM 替代方案**：AMD 上缺少确定性 GEMM 库，目前依赖 PyTorch 默认的 matmul 实现。后续可以探索基于 Triton 或 composable kernel 实现确定性 GEMM，进一步收紧数值对齐的保证。
+- **开启 True On-Policy 的性能开销评估**：需要对比开启和关闭 True On-Policy 模式下的端到端训练吞吐，量化 unified decode path、native fallback、fp32 accumulation 等改动带来的性能开销，为后续优化提供 baseline。
 
 ## 致谢
 
